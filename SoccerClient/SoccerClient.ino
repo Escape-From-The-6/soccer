@@ -16,6 +16,13 @@ static const uint32_t FRAME_MIN_MS=25; // ~40 fps
 static uint32_t nextFrameAt=0;
 static bool ledsDirty=true;
 
+// Life-loss red flash
+static bool     lifeFlashActive = false;
+static uint32_t lifeFlashUntil  = 0;
+
+// Penalty mode (levels 3 & 4)
+static bool penaltyMode = false;  // when true, non-target zones on active arena are red
+
 // ================= ESP-NOW control =================
 static bool espNowStarted=false;
 static void startEspNow(){ if(!espNowStarted){ wifiStaOnCh6(); if(nowInit()){ esp_now_register_recv_cb(nullptr); espNowStarted=true; }}}
@@ -24,8 +31,15 @@ static void stopEspNow(){ if(espNowStarted){ esp_now_deinit(); espNowStarted=fal
 // ================= Control Queues (WiFi/OTA/Name) =================
 static char qWifiSsid[32]={0}; static char qWifiPass[64]={0}; static volatile bool qWifiPending=false;
 static char qOtaUrl[192]={0};  static volatile bool qOtaPending=false;
-static inline void queueWifiSet(const char* ssid,const char* pass){ if(ssid){strncpy(qWifiSsid,ssid,31);qWifiSsid[31]=0;}else qWifiSsid[0]=0; if(pass){strncpy(qWifiPass,pass,63);qWifiPass[63]=0;}else qWifiPass[0]=0; qWifiPending=true; }
-static inline void queueOta(const char* url){ if(url){strncpy(qOtaUrl,url,191);qOtaUrl[191]=0;}else qOtaUrl[0]=0; qOtaPending=true; }
+static inline void queueWifiSet(const char* ssid,const char* pass){
+  if(ssid){strncpy(qWifiSsid,ssid,31);qWifiSsid[31]=0;}else qWifiSsid[0]=0;
+  if(pass){strncpy(qWifiPass,pass,63);qWifiPass[63]=0;}else qWifiPass[0]=0;
+  qWifiPending=true;
+}
+static inline void queueOta(const char* url){
+  if(url){strncpy(qOtaUrl,url,191);qOtaUrl[191]=0;}else qOtaUrl[0]=0;
+  qOtaPending=true;
+}
 static bool connectForOta(String* why=nullptr){
   String ssid,pass; nvsLoadWifi(ssid,pass);
   WiFi.disconnect(true,true); delay(50);
@@ -88,59 +102,165 @@ static const Seg TOP_MAP[24] = {
 };
 #undef B
 
-// ===== Local instantaneous RED (current level) =====
-// We'll OR local bits with server overlay for rendering.
-static uint8_t localTopBits[3]  = {0,0,0};
-static uint8_t localSideBits[2]   = {0,0};
-
-static inline void clearBits(uint8_t* b, size_t n){ memset(b,0,n); }
-static inline void setBit(uint8_t* b, int idx){ if (idx<1) return; idx-=1; b[idx>>3] |=  (1<< (idx&7)); }
-static inline bool bitIsSet(const uint8_t* b, int idx){ if(idx<1) return false; idx-=1; return (b[idx>>3] >> (idx&7)) & 1; }
-
-// ===== Server overlay bits (short flashes) =====
+// ===== Server-driven target bits =====
+// We will interpret these as GREEN target zones.
+// Base is neutral (off) or red (penalty mode, when active).
 static uint8_t overlayTopBits[3]  = {0,0,0};
 static uint8_t overlaySideBits[2] = {0,0};
+
+static inline bool bitIsSet(const uint8_t* b, int idx){
+  if(idx<1) return false;
+  idx-=1;
+  return (b[idx>>3] >> (idx&7)) & 1;
+}
 
 // ================= RX (apply overlays; keep control queues) =================
 static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len){
   if (len < (int)sizeof(MsgHeader)) return; const MsgHeader* h=(const MsgHeader*)data;
 
-  if (h->kind == MSG_WIFI_SET && len >= (int)sizeof(WifiSetMsg)){ const WifiSetMsg* m=(const WifiSetMsg*)data; if(!nameMatches(m->h.target,deviceName)) return; queueWifiSet(m->ssid,m->pass); return; }
-  if (h->kind == MSG_OTA_TRIGGER && len >= (int)sizeof(OtaMsg)){ const OtaMsg* m=(const OtaMsg*)data; if(!nameMatches(m->h.target,deviceName)) return; if(!m->url[0]) return; queueOta(m->url); return; }
-  if (h->kind == MSG_NAME_SET && len >= (int)sizeof(NameSetMsg)){ const NameSetMsg* m=(const NameSetMsg*)data; if(!nameMatches(m->h.target,deviceName)) return; String nn=String(m->name); nn.trim(); if(nn.length()){ nvsSaveName(nn); deviceName=nn; delay(150); ESP.restart(); } return; }
-  if (h->kind == MSG_HELLO_REQ){ HelloMsg hm{}; hm.h.kind=MSG_HELLO; strncpy(hm.h.target,"ALL",sizeof(hm.h.target)-1); strncpy(hm.name,deviceName.c_str(),sizeof(hm.name)-1); esp_now_send(BCAST,(uint8_t*)&hm,sizeof(hm)); return; }
+  if (h->kind == MSG_WIFI_SET && len >= (int)sizeof(WifiSetMsg)){
+    const WifiSetMsg* m=(const WifiSetMsg*)data;
+    if(!nameMatches(m->h.target,deviceName)) return;
+    queueWifiSet(m->ssid,m->pass);
+    return;
+  }
+  if (h->kind == MSG_OTA_TRIGGER && len >= (int)sizeof(OtaMsg)){
+    const OtaMsg* m=(const OtaMsg*)data;
+    if(!nameMatches(m->h.target,deviceName)) return;
+    if(!m->url[0]) return;
+    queueOta(m->url);
+    return;
+  }
+  if (h->kind == MSG_NAME_SET && len >= (int)sizeof(NameSetMsg)){
+    const NameSetMsg* m=(const NameSetMsg*)data;
+    if(!nameMatches(m->h.target,deviceName)) return;
+    String nn=String(m->name); nn.trim();
+    if(nn.length()){
+      nvsSaveName(nn);
+      deviceName=nn;
+      delay(150);
+      ESP.restart();
+    }
+    return;
+  }
+  if (h->kind == MSG_HELLO_REQ){
+    HelloMsg hm{}; hm.h.kind=MSG_HELLO; strncpy(hm.h.target,"ALL",sizeof(hm.h.target)-1);
+    strncpy(hm.name,deviceName.c_str(),sizeof(hm.name)-1);
+    esp_now_send(BCAST,(uint8_t*)&hm,sizeof(hm));
+    return;
+  }
 
+  // Target overlays from server
   if (ROLE_TOPRIGHT && h->kind == MSG_LED_TOP && len >= (int)sizeof(LedTopMsg)){
-    const LedTopMsg* m=(const LedTopMsg*)data; if(!nameMatches(m->h.target,deviceName)) return;
-    memcpy(overlayTopBits, m->bits, sizeof(overlayTopBits)); ledsDirty = true; return;
+    const LedTopMsg* m=(const LedTopMsg*)data;
+    if(!nameMatches(m->h.target,deviceName)) return;
+    memcpy(overlayTopBits, m->bits, sizeof(overlayTopBits));
+    ledsDirty = true;
+    return;
   }
   if (ROLE_SIDE && h->kind == MSG_LED_SIDE && len >= (int)sizeof(LedSideMsg)){
-    const LedSideMsg* m=(const LedSideMsg*)data; if(!nameMatches(m->h.target,deviceName)) return;
-    memcpy(overlaySideBits, m->bits, sizeof(overlaySideBits)); ledsDirty = true; return;
+    const LedSideMsg* m=(const LedSideMsg*)data;
+    if(!nameMatches(m->h.target,deviceName)) return;
+    memcpy(overlaySideBits, m->bits, sizeof(overlaySideBits));
+    ledsDirty = true;
+    return;
+  }
+
+  // Life-loss red flash
+  if (h->kind == MSG_LIFE_FLASH && len >= (int)sizeof(LifeFlashMsg)){
+    const LifeFlashMsg* m=(const LifeFlashMsg*)data;
+    if(!nameMatches(m->h.target,deviceName)) return;
+    uint16_t dur = m->durationMs;
+    if (dur == 0) dur = 300; // fallback
+    lifeFlashActive = true;
+    lifeFlashUntil  = millis() + dur;
+    ledsDirty = true;
+    return;
+  }
+
+  // Mode: penalty on/off
+  if (h->kind == MSG_MODE && len >= (int)sizeof(ModeMsg)){
+    const ModeMsg* m=(const ModeMsg*)data;
+    if(!nameMatches(m->h.target,deviceName)) return;
+    penaltyMode = (m->penaltyMode != 0);
+    ledsDirty = true;
+    return;
   }
 }
 
-// ================= Rendering (local OR overlay) =================
+// ================= Rendering =================
 static void renderFrame(){
   if (LED_COUNT==0 || strip==nullptr) return;
 
-  // Base green
-  for (uint16_t i=0;i<LED_COUNT;i++) strip->setPixelColor(i, strip->Color(0,255,0));
+  uint32_t now = millis();
+  if (lifeFlashActive && now >= lifeFlashUntil){
+    lifeFlashActive = false;
+  }
+
+  if (lifeFlashActive){
+    // Full red flash on life loss
+    for (uint16_t i=0;i<LED_COUNT;i++) strip->setPixelColor(i, strip->Color(255,0,0));
+    strip->show();
+    return;
+  }
+
+  // Base neutral (off)
+  for (uint16_t i=0;i<LED_COUNT;i++) strip->setPixelColor(i, strip->Color(0,0,0));
 
   if (ROLE_SIDE){
-    // combine
-    uint8_t bits[2]; bits[0] = localSideBits[0] | overlaySideBits[0]; bits[1] = localSideBits[1] | overlaySideBits[1];
-    for (int id=1; id<=13; ++id){
-      if (!bitIsSet(bits, id)) continue;
-      Seg s = SIDE_MAP[id];
-      for (uint16_t p=s.a; p<=s.b && p<LED_COUNT; ++p) strip->setPixelColor(p, strip->Color(255,0,0));
+    uint8_t bits[2];
+    bits[0] = overlaySideBits[0];
+    bits[1] = overlaySideBits[1];
+
+    bool any = bits[0] || bits[1];
+
+    if (!penaltyMode || !any){
+      // Normal: only targets are green, everything else off
+      for (int id=1; id<=13; ++id){
+        if (!bitIsSet(bits, id)) continue;
+        Seg s = SIDE_MAP[id];
+        for (uint16_t p=s.a; p<=s.b && p<LED_COUNT; ++p){
+          strip->setPixelColor(p, strip->Color(0,255,0)); // GREEN target
+        }
+      }
+    } else {
+      // Penalty mode: active arena -> non-target = RED, target = GREEN
+      for (int id=1; id<=13; ++id){
+        Seg s = SIDE_MAP[id];
+        bool isTarget = bitIsSet(bits, id);
+        uint32_t color = isTarget ? strip->Color(0,255,0) : strip->Color(255,0,0);
+        for (uint16_t p=s.a; p<=s.b && p<LED_COUNT; ++p){
+          strip->setPixelColor(p, color);
+        }
+      }
     }
   } else if (ROLE_TOPRIGHT){
-    uint8_t bits[3]; bits[0]=localTopBits[0] | overlayTopBits[0]; bits[1]=localTopBits[1] | overlayTopBits[1]; bits[2]=localTopBits[2] | overlayTopBits[2];
-    for (int id=1; id<=23; ++id){
-      if (!bitIsSet(bits, id)) continue;
-      Seg s = TOP_MAP[id];
-      for (uint16_t p=s.a; p<=s.b && p<LED_COUNT; ++p) strip->setPixelColor(p, strip->Color(255,0,0));
+    uint8_t bits[3];
+    bits[0] = overlayTopBits[0];
+    bits[1] = overlayTopBits[1];
+    bits[2] = overlayTopBits[2];
+
+    bool any = bits[0] || bits[1] || bits[2];
+
+    if (!penaltyMode || !any){
+      // Normal: only targets are green
+      for (int id=1; id<=23; ++id){
+        if (!bitIsSet(bits, id)) continue;
+        Seg s = TOP_MAP[id];
+        for (uint16_t p=s.a; p<=s.b && p<LED_COUNT; ++p){
+          strip->setPixelColor(p, strip->Color(0,255,0)); // GREEN target
+        }
+      }
+    } else {
+      // Penalty mode: active arena -> non-target = RED, target = GREEN
+      for (int id=1; id<=23; ++id){
+        Seg s = TOP_MAP[id];
+        bool isTarget = bitIsSet(bits, id);
+        uint32_t color = isTarget ? strip->Color(0,255,0) : strip->Color(255,0,0);
+        for (uint16_t p=s.a; p<=s.b && p<LED_COUNT; ++p){
+          strip->setPixelColor(p, color);
+        }
+      }
     }
   }
 
@@ -156,8 +276,13 @@ void setup(){
   ROLE_TOPRIGHT = deviceName.equalsIgnoreCase("Soccer-topright");
   ROLE_SIDE     = deviceName.equalsIgnoreCase("Soccer-side");
 
-  if (ROLE_TOPRIGHT){ S=S_topright; S_COUNT=sizeof(S_topright)/sizeof(S_topright[0]); LED_COUNT=183; }
-  else{ S=S_left_side; S_COUNT=sizeof(S_left_side)/sizeof(S_left_side[0]); LED_COUNT = ROLE_SIDE ? 107 : 0; }
+  if (ROLE_TOPRIGHT){
+    S=S_topright; S_COUNT=sizeof(S_topright)/sizeof(S_topright[0]); LED_COUNT=183;
+  }
+  else{
+    S=S_left_side; S_COUNT=sizeof(S_left_side)/sizeof(S_left_side[0]);
+    LED_COUNT = ROLE_SIDE ? 107 : 0;
+  }
 
   for (uint8_t i=0;i<S_COUNT;i++){
     pinMode(S[i].pin, INPUT_PULLUP);      // strong bias
@@ -188,19 +313,26 @@ void setup(){
 
 void loop(){
   // WiFi/OTA queues
-  if (qWifiPending){ qWifiPending=false; nvsSaveWifi(String(qWifiSsid),String(qWifiPass)); delay(150); ESP.restart(); }
+  if (qWifiPending){
+    qWifiPending=false;
+    nvsSaveWifi(String(qWifiSsid),String(qWifiPass));
+    delay(150);
+    ESP.restart();
+  }
   if (qOtaPending){
-    qOtaPending=false; String url=String(qOtaUrl);
+    qOtaPending=false;
+    String url=String(qOtaUrl);
     stopEspNow(); delay(50);
-    String why; if (connectForOta(&why)){ WiFiClient client; HTTPUpdate up; up.rebootOnUpdate(true); up.update(client,url); }
-    wifiStaOnCh6(); startEspNow();
+    String why;
+    if (connectForOta(&why)){
+      WiFiClient client; HTTPUpdate up; up.rebootOnUpdate(true); up.update(client,url);
+    }
+    wifiStaOnCh6();
+    startEspNow();
   }
 
   // Poll sensors (fast), like your test
   uint32_t now = millis();
-  // rebuild local instant bits every loop
-  clearBits(localTopBits,  sizeof(localTopBits));
-  clearBits(localSideBits, sizeof(localSideBits));
 
   for (uint8_t i=0;i<S_COUNT;i++){
     Sensor &s = S[i];
@@ -224,15 +356,6 @@ void loop(){
         }
       }
       // We do NOT send CLEARs anymore.
-    }
-
-    // Local instantaneous RED while LOW (like test)
-    if (s.debounced == LOW){
-      if (ROLE_SIDE && s.id<=13) setBit(localSideBits, s.id);
-      if (ROLE_TOPRIGHT){
-        // TopRight’s own sensors: ids 15..24; show on corresponding TOP ids (15..23 are mapped, 24 ignored)
-        if (s.id>=1 && s.id<=23) setBit(localTopBits, s.id);
-      }
     }
   }
 
