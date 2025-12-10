@@ -23,6 +23,12 @@ static uint32_t lifeFlashUntil  = 0;
 // Penalty mode (levels 3 & 4)
 static bool penaltyMode = false;  // when true, non-target zones on active arena are red
 
+// Bonus round flag (from server)
+static bool bonusRoundActive = false;
+
+// Rainbow animation phase
+static uint8_t rainbowPhase = 0;
+
 // ================= ESP-NOW control =================
 static bool espNowStarted=false;
 static void startEspNow(){ if(!espNowStarted){ wifiStaOnCh6(); if(nowInit()){ esp_now_register_recv_cb(nullptr); espNowStarted=true; }}}
@@ -103,8 +109,8 @@ static const Seg TOP_MAP[24] = {
 #undef B
 
 // ===== Server-driven target bits =====
-// We will interpret these as GREEN target zones.
-// Base is neutral (off) or red (penalty mode, when active).
+// We will interpret these as target zones.
+// Normal: green; penalty: red/green; bonus: rainbow targets only.
 static uint8_t overlayTopBits[3]  = {0,0,0};
 static uint8_t overlaySideBits[2] = {0,0};
 
@@ -112,6 +118,20 @@ static inline bool bitIsSet(const uint8_t* b, int idx){
   if(idx<1) return false;
   idx-=1;
   return (b[idx>>3] >> (idx&7)) & 1;
+}
+
+// Rainbow helper
+static uint32_t wheelColor(uint8_t pos){
+  pos = 255 - pos;
+  if(pos < 85){
+    return strip->Color(255 - pos * 3, 0, pos * 3);
+  }
+  if(pos < 170){
+    pos -= 85;
+    return strip->Color(0, pos * 3, 255 - pos * 3);
+  }
+  pos -= 170;
+  return strip->Color(pos * 3, 255 - pos * 3, 0);
 }
 
 // ================= RX (apply overlays; keep control queues) =================
@@ -186,6 +206,15 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     ledsDirty = true;
     return;
   }
+
+  // Round info: bonus round flag
+  if (h->kind == MSG_ROUND_INFO && len >= (int)sizeof(RoundInfoMsg)){
+    const RoundInfoMsg* m=(const RoundInfoMsg*)data;
+    if(!nameMatches(m->h.target,deviceName)) return;
+    bonusRoundActive = (m->bonusRound != 0);
+    ledsDirty = true;
+    return;
+  }
 }
 
 // ================= Rendering =================
@@ -197,6 +226,9 @@ static void renderFrame(){
     lifeFlashActive = false;
   }
 
+  // Advance rainbow phase every frame
+  rainbowPhase++;
+
   if (lifeFlashActive){
     // Full red flash on life loss
     for (uint16_t i=0;i<LED_COUNT;i++) strip->setPixelColor(i, strip->Color(255,0,0));
@@ -207,6 +239,7 @@ static void renderFrame(){
   // Base neutral (off)
   for (uint16_t i=0;i<LED_COUNT;i++) strip->setPixelColor(i, strip->Color(0,0,0));
 
+  // ----- SIDE -----
   if (ROLE_SIDE){
     uint8_t bits[2];
     bits[0] = overlaySideBits[0];
@@ -214,7 +247,17 @@ static void renderFrame(){
 
     bool any = bits[0] || bits[1];
 
-    if (!penaltyMode || !any){
+    if (bonusRoundActive && any){
+      // BONUS: rainbow targets, no penalty coloring
+      for (int id=1; id<=13; ++id){
+        if (!bitIsSet(bits, id)) continue;
+        Seg s = SIDE_MAP[id];
+        for (uint16_t p=s.a; p<=s.b && p<LED_COUNT; ++p){
+          uint8_t pos = (uint8_t)((p + rainbowPhase) & 0xFF);
+          strip->setPixelColor(p, wheelColor(pos));
+        }
+      }
+    } else if (!penaltyMode || !any){
       // Normal: only targets are green, everything else off
       for (int id=1; id<=13; ++id){
         if (!bitIsSet(bits, id)) continue;
@@ -234,7 +277,10 @@ static void renderFrame(){
         }
       }
     }
-  } else if (ROLE_TOPRIGHT){
+  }
+
+  // ----- TOPRIGHT -----
+  else if (ROLE_TOPRIGHT){
     uint8_t bits[3];
     bits[0] = overlayTopBits[0];
     bits[1] = overlayTopBits[1];
@@ -242,7 +288,17 @@ static void renderFrame(){
 
     bool any = bits[0] || bits[1] || bits[2];
 
-    if (!penaltyMode || !any){
+    if (bonusRoundActive && any){
+      // BONUS: rainbow targets, no penalty coloring
+      for (int id=1; id<=23; ++id){
+        if (!bitIsSet(bits, id)) continue;
+        Seg s = TOP_MAP[id];
+        for (uint16_t p=s.a; p<=s.b && p<LED_COUNT; ++p){
+          uint8_t pos = (uint8_t)((p + rainbowPhase) & 0xFF);
+          strip->setPixelColor(p, wheelColor(pos));
+        }
+      }
+    } else if (!penaltyMode || !any){
       // Normal: only targets are green
       for (int id=1; id<=23; ++id){
         if (!bitIsSet(bits, id)) continue;
