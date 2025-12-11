@@ -54,7 +54,7 @@ struct Config {
   uint8_t  topBlocks;          // Level1/3: blocks on top
   uint8_t  sideBlocks;         // Level1/3: blocks on side
   uint32_t scoreRearmMs;       // per-sensor score re-arm
-  uint32_t roundChangeGraceMs; // ignore hits for this long after round start
+  uint32_t roundChangeGraceMs; // ignore hits for this long after round start/shrink
 };
 
 static Config cfg = {
@@ -109,14 +109,12 @@ struct Game {
   uint32_t    roundStartMs  = 0;
   uint32_t    roundDurationMs = 0;
 
-  // block layout (for warmup / hit-all)
   uint8_t     blockCount    = 0;
   uint8_t     blockMin[8];
   uint8_t     blockMax[8];
   bool        blockCleared[8];
 
-  // warmup: which block is active
-  uint8_t     activeBlock   = 0;
+  uint8_t     activeBlock   = 0;   // warmup: which block is active
 };
 
 static Game g;
@@ -124,11 +122,11 @@ static Game g;
 // Shrinking round (Round 4) state
 struct ShrinkState {
   bool     active;
-  uint8_t  center;         // current center sensor id
+  uint8_t  center;         // center sensor id
   uint8_t  stage;          // 0=full, 1=mid, 2=narrow
-  uint8_t  widths[3];      // {7,5,3} or {5,3,1} depending on level
-  uint8_t  minId;          // current min id (for scoring)
-  uint8_t  maxId;          // current max id (for scoring)
+  uint8_t  widths[3];      // {7,5,3} or {5,3,1}
+  uint8_t  minId;          // current min id
+  uint8_t  maxId;          // current max id
 };
 
 static ShrinkState shrink = {false,0,0,{0,0,0},0,0};
@@ -138,7 +136,7 @@ static uint16_t shrinkHits = 0;
 struct BonusState {
   bool     active;
   uint8_t  center;         // current center
-  int8_t   dir;            // +1 or -1 movement
+  int8_t   dir;            // +1 or -1
   uint8_t  width;          // window width (e.g. 3)
   uint8_t  minId;
   uint8_t  maxId;
@@ -146,29 +144,40 @@ struct BonusState {
 };
 
 static BonusState bonus = {false,0,1,3,0,0,0};
-static const uint32_t BONUS_DURATION_MS = 15000;   // 15s (for now)
-static const uint32_t BONUS_STEP_MS     = 80;      // how fast the window slides
+static const uint32_t BONUS_DURATION_MS = 15000;   // 15s
+static const uint32_t BONUS_STEP_MS     = 80;      // sliding speed
 
-// Per-sensor score re-arm (index by sensor_id; 0 unused)
+// Per-sensor score re-arm
 static uint32_t lastScoreMsBySensor[32] = {0};
 
-// Round-change grace: ignore scoring until this time (ms)
+// Global hit grace: after any meaningful hit (score or life change),
+// ignore further events for a brief period so a single ball can't
+// generate multiple processed hits across different sensors.
+static uint32_t lastHitGlobalMs = 0;
+static const uint32_t HIT_GLOBAL_GRACE_MS = 120;  // ms; tune as needed
+
+// Grace window after round start/shrink
 static uint32_t roundChangeIgnoreUntil = 0;
 
-// Quickflash for WARMUP hits (blink block off briefly)
+// Warmup hit flash
 static bool     hitFlashActive    = false;
-static uint8_t  hitFlashBlock     = 0;      // which block to flash (0-based)
+static uint8_t  hitFlashBlock     = 0;
 static uint32_t hitFlashUntilMs   = 0;
-static const uint32_t HIT_FLASH_MS = 120;   // how long the block is "off"
+static const uint32_t HIT_FLASH_MS = 120;
 
 // Sensor counts
 static const uint8_t TOP_SENSOR_COUNT  = 23;
 static const uint8_t SIDE_SENSOR_COUNT = 13;
 
-// ========== Target bitmasks (server -> clients) ==========
-static uint8_t targetTopBits[3]  = {0,0,0}; // sensors 1..23
-static uint8_t targetSideBits[2] = {0,0};   // sensors 1..13
+// Targets (server -> clients)
+static uint8_t targetTopBits[3]  = {0,0,0};
+static uint8_t targetSideBits[2] = {0,0};
 
+// LED cadence
+static uint32_t nextLedPushAt=0;
+static const uint32_t LED_PUSH_MIN_MS=40;
+
+// ========== Target helpers ==========
 static inline void clearTargets(){
   memset(targetTopBits,  0, sizeof(targetTopBits));
   memset(targetSideBits, 0, sizeof(targetSideBits));
@@ -186,8 +195,6 @@ static inline void setSideBit(uint8_t sensorId){
   targetSideBits[idx>>3] |= (1 << (idx&7));
 }
 
-// Split 1..totalSensors into blockCount contiguous blocks and
-// return min/max sensor id for blockIdx (0-based).
 static void computeBlockRange(uint8_t totalSensors, uint8_t blockCount, uint8_t blockIdx,
                               uint8_t& outMinId, uint8_t& outMaxId){
   if (blockCount == 0){
@@ -207,7 +214,6 @@ static void computeBlockRange(uint8_t totalSensors, uint8_t blockCount, uint8_t 
   outMaxId = outMinId + length - 1;
 }
 
-// Rebuild target bits from current Game state for static rounds (WARMUP/HIT_ALL_*).
 static void rebuildTargetsFromBlocks(){
   clearTargets();
   if (!g.active) return;
@@ -238,8 +244,6 @@ static void rebuildTargetsFromBlocks(){
   }
 }
 
-// Helper: initialize blocks for current round / arena
-// NOTE: callers must set g.arena before calling this.
 static void initBlocksForArena(uint8_t blockCount,
                                uint8_t totalTopSensors,
                                uint8_t totalSideSensors,
@@ -257,23 +261,17 @@ static void initBlocksForArena(uint8_t blockCount,
   }
 }
 
-// ========== LED push cadence ==========
-static uint32_t nextLedPushAt=0;
-static const uint32_t LED_PUSH_MIN_MS=40;   // ~25 fps cap
-
+// ========== LED push ==========
 static void pushLedStates(){
-  // Local copies so we can apply hitFlash without mutating canonical targets
   uint8_t sendTop[3];  memcpy(sendTop,  targetTopBits,  sizeof(targetTopBits));
   uint8_t sendSide[2]; memcpy(sendSide, targetSideBits, sizeof(targetSideBits));
 
   uint32_t now = millis();
 
-  // Expire hit flash if needed
   if (hitFlashActive && now >= hitFlashUntilMs){
     hitFlashActive = false;
   }
 
-  // Apply quickflash only in WARMUP: briefly turn off the hit block
   if (hitFlashActive && g.roundKind == RK_WARMUP && g.blockCount > 0){
     uint8_t b = hitFlashBlock;
     if (b < g.blockCount){
@@ -313,8 +311,6 @@ static void pushLedStates(){
 
 // ========== Shrinking round (Round 4) ==========
 static void shrinkingInitWidths(){
-  // Levels 1 & 3 -> widths 7,5,3
-  // Levels 2 & 4 -> widths 5,3,1
   if (g.levelIndex == 1 || g.levelIndex == 3){
     shrink.widths[0] = 7;
     shrink.widths[1] = 5;
@@ -359,7 +355,7 @@ static void updateShrinkingTargets(){
   }
 }
 
-// ========== Bonus sliding target update (Round 5) ==========
+// ========== Bonus sliding round (Round 5) ==========
 static void updateBonusTargets(){
   if (!bonus.active || !g.active) return;
   if (g.roundKind != RK_BONUS_MOVING) return;
@@ -372,10 +368,7 @@ static void updateBonusTargets(){
   uint8_t maxSensors = (g.arena == ARENA_TOP) ? TOP_SENSOR_COUNT : SIDE_SENSOR_COUNT;
   int halfSpan = bonus.width / 2;
 
-  // Move center
   int newCenter = (int)bonus.center + (int)bonus.dir;
-
-  // Bounce at edges (keeping window in range)
   if (newCenter - halfSpan < 1){
     newCenter = 1 + halfSpan;
     bonus.dir = +1;
@@ -395,7 +388,6 @@ static void updateBonusTargets(){
     for (uint8_t id=bonus.minId; id<=bonus.maxId; ++id) setSideBit(id);
   }
 
-  // Force LED push ASAP
   nextLedPushAt = now;
 }
 
@@ -405,7 +397,7 @@ static uint32_t helloNextAt=0, listPrintAt=0;
 static const uint8_t  HELLO_DRIP_COUNT=5;
 static const uint32_t HELLO_DRIP_INTERVAL_MS=200, HELLO_SETTLE_MS=350;
 
-// ========== Sends (WIFI/OTA/NAME/LIFE_FLASH/MODE/ROUND_INFO) ==========
+// ========== Sends ==========
 static void sendHelloReqAll(){
   MsgHeader h{}; h.kind=MSG_HELLO_REQ; strncpy(h.target,"ALL",sizeof(h.target)-1);
   esp_now_send(BCAST,(uint8_t*)&h,sizeof(h));
@@ -467,10 +459,14 @@ static void onShrinkCleared();
 static void onBonusCleared();
 static void finishLevelAdvance();
 
-// Lose a life and restart the current round (for timeouts)
+// ========== Life loss helpers ==========
 static void loseLifeAndRestart(const char* reason){
   if (!g.active) return;
   if (g.lives > 0) g.lives--;
+
+  // Global hit grace: a life-loss is also a "hit event"
+  lastHitGlobalMs = millis();
+
   Serial.printf("[L%uR%u] %s -> life lost, lives=%u (score=%lu)\n",
     (unsigned)g.levelIndex,
     (unsigned)(g.roundIndex+1),
@@ -493,10 +489,13 @@ static void loseLifeAndRestart(const char* reason){
   restartCurrentRound();
 }
 
-// Lose a life without restarting (wrong hits in penaltyMode)
 static void loseLifeOnly(const char* reason){
   if (!g.active) return;
   if (g.lives > 0) g.lives--;
+
+  // Global hit grace
+  lastHitGlobalMs = millis();
+
   Serial.printf("[L%uR%u] %s -> life lost (no restart), lives=%u (score=%lu)\n",
     (unsigned)g.levelIndex,
     (unsigned)(g.roundIndex+1),
@@ -516,7 +515,7 @@ static void loseLifeOnly(const char* reason){
   }
 }
 
-// Helper: get LevelConfig by index
+// ========== Level helpers ==========
 static const struct LevelConfig* getLevelConfig(uint8_t idx){
   for (size_t i=0;i<sizeof(levelConfigs)/sizeof(levelConfigs[0]);++i){
     if (levelConfigs[i].index == idx) return &levelConfigs[i];
@@ -524,7 +523,6 @@ static const struct LevelConfig* getLevelConfig(uint8_t idx){
   return nullptr;
 }
 
-// Determine layout blocks for current level
 static void getLayoutBlocks(uint8_t& topBlocks, uint8_t& sideBlocks){
   if (!g.level) { topBlocks = 0; sideBlocks = 0; return; }
   if (g.level->useLayout2){
@@ -536,13 +534,11 @@ static void getLayoutBlocks(uint8_t& topBlocks, uint8_t& sideBlocks){
   }
 }
 
-// Restart current round after timeout
 static void restartCurrentRound(){
   if (!g.level) return;
   startRound(g.roundIndex);
 }
 
-// Advance to next static round (WARMUP/HIT_ALL) when cleared
 static void onRoundCleared(){
   if (!g.level) return;
 
@@ -556,13 +552,11 @@ static void onRoundCleared(){
     return;
   }
 
-  // Fallback: if we somehow finish last static round without SHRINKING/BONUS, finish level
   if (g.roundKind != RK_SHRINKING && g.roundKind != RK_BONUS_MOVING){
     finishLevelAdvance();
   }
 }
 
-// Level progression after finishing all rounds
 static void finishLevelAdvance(){
   if (g.levelIndex == 1){
     Serial.printf("[L1] complete, advancing to Level 2 (score=%lu, lives=%u)\n",
@@ -585,7 +579,6 @@ static void finishLevelAdvance(){
   }
 }
 
-// After shrinking round (Round 4) is cleared
 static void onShrinkCleared(){
   shrink.active = false;
   clearTargets();
@@ -607,11 +600,13 @@ static void onShrinkCleared(){
   finishLevelAdvance();
 }
 
-// After bonus sliding round (Round 5) is cleared or times out
 static void onBonusCleared(){
   bonus.active = false;
   clearTargets();
   pushLedStates();
+
+  // Extra safety: explicitly tell clients bonus is over
+  sendRoundInfo(false);
 
   Serial.printf("[L%uR%u] BONUS round complete (score=%lu, lives=%u)\n",
     (unsigned)g.levelIndex,
@@ -622,7 +617,7 @@ static void onBonusCleared(){
   finishLevelAdvance();
 }
 
-// Start a specific round of the current level
+// ========== Rounds ==========
 static void startRound(uint8_t roundIdx){
   if (!g.level) return;
   if (roundIdx >= g.level->numRounds) return;
@@ -638,10 +633,8 @@ static void startRound(uint8_t roundIdx){
   shrink.active = false;
   bonus.active  = false;
 
-  // Inform clients whether this is a bonus round
   sendRoundInfo(g.roundKind == RK_BONUS_MOVING);
 
-  // Round duration
   if (g.roundKind == RK_WARMUP){
     g.roundDurationMs = cfg.r1DurationMs;
   } else if (g.roundKind == RK_HIT_ALL_A){
@@ -810,10 +803,13 @@ static void startRound(uint8_t roundIdx){
   }
 }
 
-// Start Level
+// ========== Level start ==========
 static void startLevel(uint8_t levelIndex, bool resetScoreAndLives){
   const struct LevelConfig* lc = getLevelConfig(levelIndex);
   if (!lc) return;
+
+  // Extra safety: ensure bonus flag is off at level start
+  sendRoundInfo(false);
 
   g.level      = lc;
   g.levelIndex = lc->index;
@@ -849,8 +845,8 @@ static void handleSensorEvent(const SensorEventMsg* m){
   bool isTopR  = !strcasecmp(m->name, NAME_TOPRIGHT);
   bool isSide  = !strcasecmp(m->name, NAME_SIDE);
 
-  Arena eventArena = ARENA_NONE;
-  uint8_t id = m->sensor_id;
+  Arena   eventArena = ARENA_NONE;
+  uint8_t id         = m->sensor_id;
 
   if ((isTopL || isTopR) && id >= 1 && id <= TOP_SENSOR_COUNT){
     eventArena = ARENA_TOP;
@@ -860,18 +856,25 @@ static void handleSensorEvent(const SensorEventMsg* m){
     return;
   }
 
+  // Wrong arena hits are simply ignored (per your physical layout)
   if (eventArena != g.arena) return;
 
   uint32_t now = millis();
+
+  // Ignore hits right after round start/shrink
   if (now < roundChangeIgnoreUntil) return;
 
+  // Global hit grace window
+  if ((uint32_t)(now - lastHitGlobalMs) < HIT_GLOBAL_GRACE_MS) return;
+
+  // Per-sensor re-arm
   if (id < (sizeof(lastScoreMsBySensor)/sizeof(lastScoreMsBySensor[0]))){
     uint32_t last = lastScoreMsBySensor[id];
     if ((uint32_t)(now - last) < cfg.scoreRearmMs) return;
     lastScoreMsBySensor[id] = now;
   }
 
-  // Shrinking round (Round 4)
+  // ===== SHRINKING (Round 4) =====
   if (g.roundKind == RK_SHRINKING){
     if (!shrink.active) return;
 
@@ -887,6 +890,9 @@ static void handleSensorEvent(const SensorEventMsg* m){
     g.score++;
     shrinkHits++;
 
+    // Global hit grace
+    lastHitGlobalMs = now;
+
     Serial.printf("[L%uR%u] HIT (SHRINKING) arena=%s sensor=%u stage=%u hits=%u score=%lu\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1),
@@ -899,6 +905,8 @@ static void handleSensorEvent(const SensorEventMsg* m){
     if (shrink.stage < 2){
       shrink.stage++;
       updateShrinkingTargets();
+      // Add grace after shrink so immediate out-of-window hits don't cost life
+      roundChangeIgnoreUntil = now + cfg.roundChangeGraceMs;
       nextLedPushAt = now;
     } else {
       onShrinkCleared();
@@ -906,18 +914,27 @@ static void handleSensorEvent(const SensorEventMsg* m){
     return;
   }
 
-  // Bonus sliding round (Round 5)
+  // ===== BONUS MOVING (Round 5) - with ±1 forgiveness =====
   if (g.roundKind == RK_BONUS_MOVING){
     if (!bonus.active) return;
 
-    bool inTarget = (id >= bonus.minId && id <= bonus.maxId);
+    uint8_t maxSensors = (g.arena == ARENA_TOP) ? TOP_SENSOR_COUNT : SIDE_SENSOR_COUNT;
+    uint8_t minGrace = bonus.minId;
+    if (minGrace > 1) minGrace--;
+    uint8_t maxGrace = bonus.maxId;
+    if (maxGrace < maxSensors) maxGrace++;
 
-    // Bonus: no life loss; wrong hits ignored
+    bool inTarget = (id >= minGrace && id <= maxGrace);
+
     if (!inTarget){
+      // Bonus: wrong hits are just ignored, never cost lives
       return;
     }
 
     g.score++;
+
+    // Global hit grace
+    lastHitGlobalMs = now;
 
     Serial.printf("[L%uR%u] HIT (BONUS) arena=%s sensor=%u score=%lu\n",
       (unsigned)g.levelIndex,
@@ -930,35 +947,59 @@ static void handleSensorEvent(const SensorEventMsg* m){
     return;
   }
 
-  // Warmup
+  // ===== WARMUP =====
   if (g.roundKind == RK_WARMUP){
     if (g.blockCount == 0) return;
     uint8_t b = g.activeBlock;
     if (b >= g.blockCount) return;
 
-    bool inTarget = (id >= g.blockMin[b] && id <= g.blockMax[b]);
+    // Current active block range
+    uint8_t blockMin = g.blockMin[b];
+    uint8_t blockMax = g.blockMax[b];
+
+    // Define a small "near target" grace margin of ±1 sensor around the block
+    uint8_t maxSensors = (g.arena == ARENA_TOP) ? TOP_SENSOR_COUNT : SIDE_SENSOR_COUNT;
+    uint8_t minGrace = blockMin;
+    if (minGrace > 1) minGrace--;
+    uint8_t maxGrace = blockMax;
+    if (maxGrace < maxSensors) maxGrace++;
+
+    bool inTarget   = (id >= blockMin && id <= blockMax);
+    bool nearTarget = (!inTarget && id >= minGrace && id <= maxGrace);
 
     if (!inTarget){
+      // If it's just a near miss (within grace), ignore it (no score, no life loss)
+      if (nearTarget){
+        return;
+      }
+      // Truly wrong hit (well outside the block + margin)
       if (g.penaltyMode){
         loseLifeOnly("WRONG HIT R1");
       }
       return;
     }
 
+    // Correct hit inside the active block
     g.score++;
 
+    // Global hit grace
+    lastHitGlobalMs = now;
+
+    // Flash the block that was just hit
     hitFlashActive  = true;
     hitFlashBlock   = b;
     hitFlashUntilMs = now + HIT_FLASH_MS;
 
+    // Pick a new active block within the same arena
     if (g.blockCount > 1){
       uint8_t newBlock = random(0, g.blockCount - 1);
-      if (newBlock >= b) newBlock++;
+      if (newBlock >= b) newBlock++;   // ensure different from previous
       g.activeBlock = newBlock;
     } else {
-      g.activeBlock = b;
+      g.activeBlock = b; // only one block available
     }
 
+    // Rebuild targets for the newly selected active block
     rebuildTargetsFromBlocks();
     nextLedPushAt   = now;
 
@@ -972,10 +1013,11 @@ static void handleSensorEvent(const SensorEventMsg* m){
     return;
   }
 
-  // Hit-all rounds
+  // ===== HIT_ALL_A / HIT_ALL_B =====
   if (g.roundKind == RK_HIT_ALL_A || g.roundKind == RK_HIT_ALL_B){
     if (g.blockCount == 0) return;
 
+    // Find which block this sensor falls inside
     uint8_t bFound = 255;
     for (uint8_t bIdx=0; bIdx<g.blockCount; ++bIdx){
       if (id >= g.blockMin[bIdx] && id <= g.blockMax[bIdx]){
@@ -984,17 +1026,26 @@ static void handleSensorEvent(const SensorEventMsg* m){
       }
     }
 
-    bool badHit = (bFound == 255) || (bFound < g.blockCount && g.blockCleared[bFound]);
+    // Safety: if we somehow don't map to a block, just ignore
+    if (bFound == 255) return;
 
-    if (badHit){
+    bool hitClearedBlock = g.blockCleared[bFound];
+
+    // In penalty levels, hitting a CLEARED (red) block is a wrong hit
+    if (hitClearedBlock){
       if (g.penaltyMode){
-        loseLifeOnly("WRONG HIT R2/R3");
+        loseLifeOnly("HIT CLEARED BLOCK R2/R3");
       }
       return;
     }
 
+    // Inside an uncleared (green) block -> correct hit
     g.blockCleared[bFound] = true;
     g.score++;
+
+    // Global hit grace
+    lastHitGlobalMs = now;
+
     Serial.printf("[L%uR%u] HIT arena=%s block=%u/%u sensor=%u score=%lu\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1),
@@ -1020,6 +1071,7 @@ static void handleSensorEvent(const SensorEventMsg* m){
     }
     return;
   }
+
 }
 
 // ========== RX ==========
@@ -1094,7 +1146,6 @@ static void handleSerialServer(){
   String line = Serial.readStringUntil('\n'); line.trim();
   if (!line.length()) return;
 
-  // collapse whitespace
   String norm; norm.reserve(line.length()); bool sp=false;
   for (size_t i=0;i<line.length();++i){
     char c=line[i];
@@ -1249,7 +1300,6 @@ static void handleSerialServer(){
 }
 
 // ========== setup / loop ==========
-
 void setup(){
   Serial.begin(115200); delay(200);
   nvsSaveName(myName);
@@ -1271,7 +1321,6 @@ void loop(){
 
   uint32_t now = millis();
 
-  // HELLO drip
   if (helloDripActive){
     if (helloDripRemain && (int32_t)(now - helloNextAt) >= 0){
       sendHelloReqAll(); helloDripRemain--; helloNextAt=now+HELLO_DRIP_INTERVAL_MS;
@@ -1284,19 +1333,14 @@ void loop(){
       Serial.printf(" - %s  (%lus ago)\n", seen[i].name.c_str(), (unsigned long)((now - seen[i].ms)/1000));
   }
 
-  // Update shrinking round targets
   if (g.active && g.roundKind == RK_SHRINKING){
     updateShrinkingTargets();
   }
 
-  // Update bonus sliding round targets
   if (g.active && g.roundKind == RK_BONUS_MOVING){
     updateBonusTargets();
   }
 
-  // Timers:
-  // - Warmup / Bonus: timeout => advance (no life loss)
-  // - HitAll / Shrinking: timeout => lose a life + restart same round.
   if (g.active && g.roundDurationMs > 0){
     if ((uint32_t)(now - g.roundStartMs) >= g.roundDurationMs){
       if (g.roundKind == RK_WARMUP){
