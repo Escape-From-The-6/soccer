@@ -1,28 +1,76 @@
 #include "SoccerCommon.h"
 #include <esp_system.h>
+#include <stddef.h>
 
 static String myName = "Soccer-server";
 
 // ========== Roster ==========
-struct Seen { String name; uint32_t ms; };
+
+struct Seen {
+  String   name;
+  uint32_t ms;
+  uint32_t bootCount;
+  char     build[BUILD_STR_LEN];
+  uint32_t lastHelloPrintMs;
+};
 Seen seen[32];
 
-void remember(const char* n){
-  if(!n||!*n) return;
+
+static bool rememberHello(const char* n, uint32_t bootCount=0, const char* build=nullptr){
+  if(!n||!*n) return false;
+  uint32_t now = millis();
+
+  const bool hasMeta = (bootCount != 0) || (build && *build);
+
+  // Update existing
   for(int i=0;i<32;i++){
     if (seen[i].name.equalsIgnoreCase(n)){
-      seen[i].ms = millis();
-      return;
+      seen[i].ms = now;
+
+      if (!hasMeta){
+        // Passive "seen" update (e.g., sensor events) shouldn't affect HELLO printing.
+        return false;
+      }
+
+      bool bootChanged  = (bootCount != 0 && bootCount != seen[i].bootCount);
+      bool buildChanged = false;
+      if (build && *build){
+        if (strncmp(build, seen[i].build, BUILD_STR_LEN) != 0) buildChanged = true;
+      }
+
+      if (bootCount != 0) seen[i].bootCount = bootCount;
+      if (build && *build){
+        strncpy(seen[i].build, build, BUILD_STR_LEN-1);
+        seen[i].build[BUILD_STR_LEN-1] = 0;
+      }
+
+      bool shouldPrint = bootChanged || buildChanged || (seen[i].lastHelloPrintMs==0) || (now - seen[i].lastHelloPrintMs > 1500);
+      if (shouldPrint) seen[i].lastHelloPrintMs = now;
+      return shouldPrint;
     }
   }
+
+  // Add new
   for(int i=0;i<32;i++){
     if (!seen[i].name.length()){
       seen[i].name = n;
-      seen[i].ms   = millis();
-      return;
+      seen[i].ms   = now;
+      seen[i].bootCount = bootCount;
+
+      seen[i].build[0] = 0;
+      if (build && *build){
+        strncpy(seen[i].build, build, BUILD_STR_LEN-1);
+        seen[i].build[BUILD_STR_LEN-1] = 0;
+      }
+
+      // Only HELLOs should set lastHelloPrintMs
+      seen[i].lastHelloPrintMs = hasMeta ? now : 0;
+      return hasMeta; // print if it's a HELLO with meta
     }
   }
+  return hasMeta;
 }
+
 
 // ========== Names ==========
 static const char* NAME_TOPLEFT  = "Soccer-topleft";
@@ -166,8 +214,24 @@ static uint32_t hitFlashUntilMs   = 0;
 static const uint32_t HIT_FLASH_MS = 120;
 
 // Sensor counts
-static const uint8_t TOP_SENSOR_COUNT  = 23;
+static const uint8_t TOP_SENSOR_COUNT  = 24;
 static const uint8_t SIDE_SENSOR_COUNT = 13;
+
+// Target hit forgiveness in *sensor* units (± this many sensors).
+// Applied to "correct hit" checks across all rounds that have a target window.
+// Wrong hits remain strict: only hits outside the expanded window are treated as wrong.
+static uint8_t graceTopSensors  = 1;  // per-side forgiveness around correct targets (TOP)
+static uint8_t graceSideSensors = 2;  // per-side forgiveness around correct targets (SIDE)
+
+// ========== TEST MODE (sensor->LED mapping verification) ==========
+// When enabled, the server ignores game state and simply lights the
+// LED segment corresponding to the last sensor that triggered.
+//
+// Usage (Server CLI):
+//   TEST ON
+//   TEST OFF
+//   TEST CLEAR
+static bool testMode = false;
 
 // Targets (server -> clients)
 static uint8_t targetTopBits[3]  = {0,0,0};
@@ -212,6 +276,19 @@ static void computeBlockRange(uint8_t totalSensors, uint8_t blockCount, uint8_t 
 
   outMinId = startIdx + 1;
   outMaxId = outMinId + length - 1;
+}
+
+
+static inline uint8_t graceForArena(uint8_t arena){
+  return (arena == ARENA_TOP) ? graceTopSensors : graceSideSensors;
+}
+
+static inline void computeGraceRange(uint8_t minId, uint8_t maxId, uint8_t maxSensors, uint8_t arena,
+                                     uint8_t& outMinId, uint8_t& outMaxId){
+  uint8_t g = graceForArena(arena);
+  outMinId = (minId > g) ? (uint8_t)(minId - g) : 1;
+  uint16_t mx = (uint16_t)maxId + (uint16_t)g;
+  outMaxId = (mx <= maxSensors) ? (uint8_t)mx : maxSensors;
 }
 
 static void rebuildTargetsFromBlocks(){
@@ -423,6 +500,15 @@ static void sendNameSet(const char* target,const String& newName){
   NameSetMsg m{}; m.h.kind=MSG_NAME_SET;
   strncpy(m.h.target,target,sizeof(m.h.target)-1);
   strncpy(m.name,newName.c_str(),sizeof(m.name)-1);
+  esp_now_send(BCAST,(uint8_t*)&m,sizeof(m));
+}
+
+static void sendPinSet(const char* target, uint8_t sensorId, uint8_t gpio){
+  PinSetMsg m{}; m.h.kind=MSG_PIN_SET;
+  const char* tgt=(target&&*target)?target:"ALL";
+  strncpy(m.h.target,tgt,sizeof(m.h.target)-1);
+  m.sensor_id = sensorId;
+  m.gpio      = gpio;
   esp_now_send(BCAST,(uint8_t*)&m,sizeof(m));
 }
 
@@ -837,8 +923,7 @@ static void startLevel(uint8_t levelIndex, bool resetScoreAndLives){
 
 // ========== Sensor handling ==========
 static void handleSensorEvent(const SensorEventMsg* m){
-  remember(m->name);
-  if (!g.active) return;
+  rememberHello(m->name);
   if (m->state != 1) return;
 
   bool isTopL  = !strcasecmp(m->name, NAME_TOPLEFT);
@@ -855,6 +940,28 @@ static void handleSensorEvent(const SensorEventMsg* m){
   } else {
     return;
   }
+
+  // ===== TEST MODE =====
+  // Light up the last triggered sensor as a target, so you can verify
+  // sensor wiring and the LED segment mapping visually.
+  if (testMode){
+    uint32_t now = millis();
+    if (eventArena == ARENA_TOP){
+      memset(targetTopBits, 0, sizeof(targetTopBits));
+      setTopBit(id);
+    } else if (eventArena == ARENA_SIDE){
+      memset(targetSideBits, 0, sizeof(targetSideBits));
+      setSideBit(id);
+    }
+    nextLedPushAt = now;
+    Serial.printf("[TEST] %s arena=%s sensor=%u\n",
+      m->name,
+      (eventArena==ARENA_TOP ? "TOP" : "SIDE"),
+      (unsigned)id);
+    return;
+  }
+
+  if (!g.active) return;
 
   // Wrong arena hits are simply ignored (per your physical layout)
   if (eventArena != g.arena) return;
@@ -877,9 +984,11 @@ static void handleSensorEvent(const SensorEventMsg* m){
   // ===== SHRINKING (Round 4) =====
   if (g.roundKind == RK_SHRINKING){
     if (!shrink.active) return;
+    uint8_t maxSensors = (g.arena == ARENA_TOP) ? TOP_SENSOR_COUNT : SIDE_SENSOR_COUNT;
+    uint8_t minOk, maxOk;
+    computeGraceRange(shrink.minId, shrink.maxId, maxSensors, g.arena, minOk, maxOk);
 
-    bool inTarget = (id >= shrink.minId && id <= shrink.maxId);
-
+    bool inTarget = (id >= minOk && id <= maxOk);
     if (!inTarget){
       if (g.penaltyMode){
         loseLifeOnly("WRONG HIT R4");
@@ -914,17 +1023,15 @@ static void handleSensorEvent(const SensorEventMsg* m){
     return;
   }
 
-  // ===== BONUS MOVING (Round 5) - with ±1 forgiveness =====
+    // ===== BONUS MOVING (Round 5) - with configurable forgiveness =====
   if (g.roundKind == RK_BONUS_MOVING){
     if (!bonus.active) return;
 
     uint8_t maxSensors = (g.arena == ARENA_TOP) ? TOP_SENSOR_COUNT : SIDE_SENSOR_COUNT;
-    uint8_t minGrace = bonus.minId;
-    if (minGrace > 1) minGrace--;
-    uint8_t maxGrace = bonus.maxId;
-    if (maxGrace < maxSensors) maxGrace++;
+    uint8_t minOk, maxOk;
+    computeGraceRange(bonus.minId, bonus.maxId, maxSensors, g.arena, minOk, maxOk);
 
-    bool inTarget = (id >= minGrace && id <= maxGrace);
+    bool inTarget = (id >= minOk && id <= maxOk);
 
     if (!inTarget){
       // Bonus: wrong hits are just ignored, never cost lives
@@ -947,40 +1054,34 @@ static void handleSensorEvent(const SensorEventMsg* m){
     return;
   }
 
+
   // ===== WARMUP =====
   if (g.roundKind == RK_WARMUP){
     if (g.blockCount == 0) return;
     uint8_t b = g.activeBlock;
     if (b >= g.blockCount) return;
-
     // Current active block range
     uint8_t blockMin = g.blockMin[b];
     uint8_t blockMax = g.blockMax[b];
 
-    // Define a small "near target" grace margin of ±1 sensor around the block
+    // Allow a forgiveness margin around the active block (± GRACE_SENSORS (per-arena))
     uint8_t maxSensors = (g.arena == ARENA_TOP) ? TOP_SENSOR_COUNT : SIDE_SENSOR_COUNT;
-    uint8_t minGrace = blockMin;
-    if (minGrace > 1) minGrace--;
-    uint8_t maxGrace = blockMax;
-    if (maxGrace < maxSensors) maxGrace++;
+    uint8_t minOk, maxOk;
+    computeGraceRange(blockMin, blockMax, maxSensors, g.arena, minOk, maxOk);
 
-    bool inTarget   = (id >= blockMin && id <= blockMax);
-    bool nearTarget = (!inTarget && id >= minGrace && id <= maxGrace);
+    bool inTarget = (id >= minOk && id <= maxOk);
 
     if (!inTarget){
-      // If it's just a near miss (within grace), ignore it (no score, no life loss)
-      if (nearTarget){
-        return;
-      }
-      // Truly wrong hit (well outside the block + margin)
+      // Outside the expanded window -> wrong hit
       if (g.penaltyMode){
         loseLifeOnly("WRONG HIT R1");
       }
       return;
     }
 
-    // Correct hit inside the active block
+    // Correct hit (inside block OR within grace)
     g.score++;
+
 
     // Global hit grace
     lastHitGlobalMs = now;
@@ -1013,11 +1114,72 @@ static void handleSensorEvent(const SensorEventMsg* m){
     return;
   }
 
-  // ===== HIT_ALL_A / HIT_ALL_B =====
+    // ===== HIT_ALL_A / HIT_ALL_B =====
   if (g.roundKind == RK_HIT_ALL_A || g.roundKind == RK_HIT_ALL_B){
     if (g.blockCount == 0) return;
 
-    // Find which block this sensor falls inside
+    uint8_t maxSensors = (g.arena == ARENA_TOP) ? TOP_SENSOR_COUNT : SIDE_SENSOR_COUNT;
+
+    // Credit the hit to an *uncleared* (green) block if the sensor is within
+    // that block OR within ±GRACE_SENSORS (per-arena) of that block boundary.
+    // Cleared (red) blocks are never "correct", and they do NOT get any grace.
+    int8_t  bestBlock = -1;
+    uint8_t bestDist  = 255;
+
+    for (uint8_t bIdx=0; bIdx<g.blockCount; ++bIdx){
+      if (g.blockCleared[bIdx]) continue;
+
+      uint8_t minOk, maxOk;
+      computeGraceRange(g.blockMin[bIdx], g.blockMax[bIdx], maxSensors, g.arena, minOk, maxOk);
+
+      if (id < minOk || id > maxOk) continue;
+
+      uint8_t dist = 0;
+      if (id < g.blockMin[bIdx]) dist = (uint8_t)(g.blockMin[bIdx] - id);
+      else if (id > g.blockMax[bIdx]) dist = (uint8_t)(id - g.blockMax[bIdx]);
+
+      if (dist < bestDist){
+        bestDist  = dist;
+        bestBlock = (int8_t)bIdx;
+        if (dist == 0) break; // can't beat an in-block hit
+      }
+    }
+
+    if (bestBlock >= 0){
+      g.blockCleared[(uint8_t)bestBlock] = true;
+      g.score++;
+
+      // Global hit grace
+      lastHitGlobalMs = now;
+
+      Serial.printf("[L%uR%u] HIT arena=%s block=%u/%u sensor=%u (graceDist=%u) score=%lu\n",
+        (unsigned)g.levelIndex,
+        (unsigned)(g.roundIndex+1),
+        (eventArena==ARENA_TOP ? "TOP" : "SIDE"),
+        (unsigned)((uint8_t)bestBlock+1),
+        (unsigned)g.blockCount,
+        (unsigned)id,
+        (unsigned)bestDist,
+        (unsigned long)g.score);
+
+      rebuildTargetsFromBlocks();
+      nextLedPushAt = now;
+
+      bool allCleared = true;
+      for (uint8_t bIdx=0; bIdx<g.blockCount; ++bIdx){
+        if (!g.blockCleared[bIdx]){
+          allCleared = false;
+          break;
+        }
+      }
+
+      if (allCleared){
+        onRoundCleared();
+      }
+      return;
+    }
+
+    // No uncleared block within grace -> only penalize if the hit is in a cleared block.
     uint8_t bFound = 255;
     for (uint8_t bIdx=0; bIdx<g.blockCount; ++bIdx){
       if (id >= g.blockMin[bIdx] && id <= g.blockMax[bIdx]){
@@ -1026,51 +1188,15 @@ static void handleSensorEvent(const SensorEventMsg* m){
       }
     }
 
-    // Safety: if we somehow don't map to a block, just ignore
     if (bFound == 255) return;
 
-    bool hitClearedBlock = g.blockCleared[bFound];
-
-    // In penalty levels, hitting a CLEARED (red) block is a wrong hit
-    if (hitClearedBlock){
-      if (g.penaltyMode){
-        loseLifeOnly("HIT CLEARED BLOCK R2/R3");
-      }
-      return;
-    }
-
-    // Inside an uncleared (green) block -> correct hit
-    g.blockCleared[bFound] = true;
-    g.score++;
-
-    // Global hit grace
-    lastHitGlobalMs = now;
-
-    Serial.printf("[L%uR%u] HIT arena=%s block=%u/%u sensor=%u score=%lu\n",
-      (unsigned)g.levelIndex,
-      (unsigned)(g.roundIndex+1),
-      (eventArena==ARENA_TOP ? "TOP" : "SIDE"),
-      (unsigned)(bFound+1),
-      (unsigned)g.blockCount,
-      (unsigned)id,
-      (unsigned long)g.score);
-
-    rebuildTargetsFromBlocks();
-    nextLedPushAt = now;
-
-    bool allCleared = true;
-    for (uint8_t bIdx=0; bIdx<g.blockCount; ++bIdx){
-      if (!g.blockCleared[bIdx]){
-        allCleared = false;
-        break;
-      }
-    }
-
-    if (allCleared){
-      onRoundCleared();
+    if (g.blockCleared[bFound] && g.penaltyMode){
+      loseLifeOnly("HIT CLEARED BLOCK R2/R3");
     }
     return;
   }
+
+
 
 }
 
@@ -1079,15 +1205,36 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   if (len < (int)sizeof(MsgHeader)) return;
   const MsgHeader* h=(const MsgHeader*)data;
 
-  if (h->kind == MSG_HELLO && len >= (int)sizeof(HelloMsg)){
-    const HelloMsg* m=(const HelloMsg*)data;
-    remember(m->name);
-    uint32_t now = millis();
-    if (!strcasecmp(m->name, NAME_TOPRIGHT) || !strcasecmp(m->name, NAME_TOPLEFT) || !strcasecmp(m->name, NAME_SIDE)) {
-      if ((int32_t)(now - nextLedPushAt) > 0) nextLedPushAt = now;
-    }
-    return;
+  
+// HELLO (clients announce themselves at boot; includes optional build/bootCount)
+const int HELLO_V1_SIZE = (int)(sizeof(MsgHeader) + 32); // header + name[32]
+if (h->kind == MSG_HELLO && len >= HELLO_V1_SIZE){
+  const HelloMsg* m=(const HelloMsg*)data;
+
+  // Backward compatible: older clients only send name[].
+  uint32_t boot = 0;
+  const char* build = "legacy";
+  if (len >= (int)(offsetof(HelloMsg, bootCount) + sizeof(uint32_t))){
+    boot = m->bootCount;
   }
+  if (len >= (int)(offsetof(HelloMsg, build) + 1)){
+    build = m->build;
+    if (!build[0]) build = "unknown";
+  }
+
+  bool shouldPrint = rememberHello(m->name, boot, build);
+  if (shouldPrint){
+    Serial.printf("[HELLO] %s  boot=%lu  build=%s\n",
+      m->name, (unsigned long)boot, build);
+  }
+
+  uint32_t now = millis();
+  if (!strcasecmp(m->name, NAME_TOPRIGHT) || !strcasecmp(m->name, NAME_TOPLEFT) || !strcasecmp(m->name, NAME_SIDE)) {
+    if ((int32_t)(now - nextLedPushAt) > 0) nextLedPushAt = now;
+  }
+  return;
+}
+
 
   if (h->kind == MSG_SENSOR_EVENT && len >= (int)sizeof(SensorEventMsg)){
     const SensorEventMsg* m=(const SensorEventMsg*)data;
@@ -1111,6 +1258,8 @@ static void printCfg(){
   Serial.printf("  L2SIDE= %u blocks (fixed)\n", (unsigned)L2_SIDE_BLOCKS);
   Serial.printf("  REARM = %lu ms\n", (unsigned long)cfg.scoreRearmMs);
   Serial.printf("  GRACE = %lu ms\n", (unsigned long)cfg.roundChangeGraceMs);
+  Serial.printf("  GRACE_TOP_SENSORS  = %u\n", (unsigned)graceTopSensors);
+  Serial.printf("  GRACE_SIDE_SENSORS = %u\n", (unsigned)graceSideSensors);
   Serial.printf("  BONUS = %lu ms\n", (unsigned long)BONUS_DURATION_MS);
   Serial.println();
 }
@@ -1123,6 +1272,7 @@ static void printHelp(){
   Serial.println("OTA ALL <url>");
   Serial.println("OTA <name> <url>");
   Serial.println("NAME <ALL|currentName> <newName>");
+  Serial.println("PIN <name> <sensorId> <gpio>  (configure client sensor GPIO; ex: PIN Soccer-topleft 14 19)");
   Serial.println("LIST");
   Serial.println("GAME START   (Level 1)");
   Serial.println("GAME L1      (Level 1)");
@@ -1130,8 +1280,13 @@ static void printHelp(){
   Serial.println("GAME L3      (Level 3 - penalty mode, layout 1, WITH warmup + bonus)");
   Serial.println("GAME L4      (Level 4 - penalty mode, layout 2, WITH warmup + bonus)");
   Serial.println("GAME STOP");
+  Serial.println("TEST ON     (sensor -> LED mapping test mode)");
+  Serial.println("TEST OFF");
+  Serial.println("TEST CLEAR  (turn all targets off while staying in TEST mode)");
+  Serial.println("TEST TOP <id>   (force a top segment to light)");
+  Serial.println("TEST SIDE <id>  (force a side segment to light)");
   Serial.println("CFG");
-  Serial.println("SET <R1DUR|R2DUR|R3DUR|R4DUR|L1TOP|L1SIDE|REARM|GRACE> <value>");
+  Serial.println("SET <R1DUR|R2DUR|R3DUR|R4DUR|L1TOP|L1SIDE|REARM|GRACE|TOPGRACE|SIDEGRACE> <value>");
   Serial.println();
   Serial.println("Examples:");
   Serial.println("  WIFI ALL AndrewiPhone 12345678");
@@ -1200,6 +1355,33 @@ static void handleSerialServer(){
     Serial.printf("Sent NAME_SET to %s -> %s\n",arg1.c_str(),rest.c_str());
     return;
   }
+  if (cmd=="PIN"){
+    if(!arg1.length()||!rest.length()){
+      Serial.println("Usage: PIN <name> <sensorId> <gpio>");
+      return;
+    }
+    int sp=rest.indexOf(' ');
+    if(sp<0){
+      Serial.println("Usage: PIN <name> <sensorId> <gpio>");
+      return;
+    }
+    String sIdStr = rest.substring(0,sp); sIdStr.trim();
+    String gpioStr = rest.substring(sp+1); gpioStr.trim();
+    int sid  = sIdStr.toInt();
+    int gpio = gpioStr.toInt();
+    if (sid < 1 || sid > 32){
+      Serial.println("sensorId must be 1..32");
+      return;
+    }
+    if (gpio < 0 || gpio > 39){
+      Serial.println("gpio must be 0..39");
+      return;
+    }
+    sendPinSet(arg1.c_str(), (uint8_t)sid, (uint8_t)gpio);
+    Serial.printf("Sent PIN_SET to %s  sensor=%d  gpio=%d\n", arg1.c_str(), sid, gpio);
+    return;
+  }
+
   if (cmd=="GAME"){
     if (!arg1.length()){
       Serial.println("Usage: GAME START|L1|L2|L3|L4|STOP");
@@ -1254,13 +1436,88 @@ static void handleSerialServer(){
     Serial.println("Usage: GAME START|L1|L2|L3|L4|STOP");
     return;
   }
+  if (cmd=="TEST"){
+    if (!arg1.length()){
+      Serial.println("Usage: TEST ON|OFF|CLEAR|TOP <id>|SIDE <id>");
+      return;
+    }
+    // Force a specific sensor to light (no physical trigger needed)
+    if (arg1.equalsIgnoreCase("TOP") || arg1.equalsIgnoreCase("SIDE")){
+      if (!rest.length()){
+        Serial.println("Usage: TEST TOP <id>   or   TEST SIDE <id>");
+        return;
+      }
+      int id = rest.toInt();
+      if (arg1.equalsIgnoreCase("TOP")){
+        if (id < 1 || id > TOP_SENSOR_COUNT){ Serial.println("TOP id out of range"); return; }
+      } else {
+        if (id < 1 || id > SIDE_SENSOR_COUNT){ Serial.println("SIDE id out of range"); return; }
+      }
+
+      if (g.active){
+        g.active = false;
+        Serial.println("[TEST] Stopping active game.");
+      }
+
+      testMode = true;
+      hitFlashActive = false;
+      clearTargets();
+
+      // Force clients into a simple, readable state.
+      sendMode(false);
+      sendRoundInfo(false);
+
+      if (arg1.equalsIgnoreCase("TOP")) setTopBit((uint8_t)id);
+      else setSideBit((uint8_t)id);
+
+      nextLedPushAt = millis();
+      Serial.printf("[TEST] Forced %s sensor=%d\n", arg1.c_str(), id);
+      return;
+    }
+
+    if (arg1.equalsIgnoreCase("ON")){
+      // Stop any active game so we don't mix targets / rules.
+      if (g.active){
+        g.active = false;
+        Serial.println("[TEST] Stopping active game.");
+      }
+
+      testMode = true;
+      hitFlashActive = false;
+      clearTargets();
+
+      // Force clients into a simple, readable state.
+      sendMode(false);
+      sendRoundInfo(false);
+
+      nextLedPushAt = millis();
+      Serial.println("[TEST] ON. Trigger a sensor; the corresponding LED segment should light GREEN.");
+      return;
+    }
+    if (arg1.equalsIgnoreCase("OFF")){
+      testMode = false;
+      hitFlashActive = false;
+      clearTargets();
+      nextLedPushAt = millis();
+      Serial.println("[TEST] OFF.");
+      return;
+    }
+    if (arg1.equalsIgnoreCase("CLEAR")){
+      clearTargets();
+      nextLedPushAt = millis();
+      Serial.println("[TEST] Cleared targets.");
+      return;
+    }
+    Serial.println("Usage: TEST ON|OFF|CLEAR|TOP <id>|SIDE <id>");
+    return;
+  }
   if (cmd=="CFG"){
     printCfg();
     return;
   }
   if (cmd=="SET"){
     if (!arg1.length() || !rest.length()){
-      Serial.println("Usage: SET <R1DUR|R2DUR|R3DUR|R4DUR|L1TOP|L1SIDE|REARM|GRACE> <value>");
+      Serial.println("Usage: SET <R1DUR|R2DUR|R3DUR|R4DUR|L1TOP|L1SIDE|REARM|GRACE|TOPGRACE|SIDEGRACE> <value>");
       return;
     }
     long v = rest.toInt();
@@ -1288,8 +1545,14 @@ static void handleSerialServer(){
     } else if (arg1.equalsIgnoreCase("GRACE")){
       if (v < 0){ Serial.println("GRACE must be >=0"); return; }
       cfg.roundChangeGraceMs = (uint32_t)v;
+    } else if (arg1.equalsIgnoreCase("TOPGRACE")){
+      if (v < 0 || v > 6){ Serial.println("TOPGRACE must be 0..6"); return; }
+      graceTopSensors = (uint8_t)v;
+    } else if (arg1.equalsIgnoreCase("SIDEGRACE")){
+      if (v < 0 || v > 6){ Serial.println("SIDEGRACE must be 0..6"); return; }
+      graceSideSensors = (uint8_t)v;
     } else {
-      Serial.println("Unknown key. Use R1DUR, R2DUR, R3DUR, R4DUR, L1TOP, L1SIDE, REARM, GRACE");
+      Serial.println("Unknown key. Use R1DUR, R2DUR, R3DUR, R4DUR, L1TOP, L1SIDE, REARM, GRACE, TOPGRACE, SIDEGRACE");
       return;
     }
     Serial.printf("SET %s = %ld\n", arg1.c_str(), v);
@@ -1309,8 +1572,10 @@ void setup(){
   esp_now_register_recv_cb(onNowRecv);
 
   HelloMsg hm{}; hm.h.kind=MSG_HELLO; strncpy(hm.h.target,"ALL",sizeof(hm.h.target)-1);
-  strncpy(hm.name,myName.c_str(),sizeof(hm.name)-1); esp_now_send(BCAST,(uint8_t*)&hm,sizeof(hm));
-
+  strncpy(hm.name,myName.c_str(),sizeof(hm.name)-1);
+  hm.bootCount = 0;
+  snprintf(hm.build, sizeof(hm.build), "%s %s", __DATE__, __TIME__);
+  esp_now_send(BCAST,(uint8_t*)&hm,sizeof(hm));
   randomSeed(esp_random());
 
   Serial.println("Server ready. Type HELP for commands.");
@@ -1330,7 +1595,11 @@ void loop(){
   if (listPrintAt && (int32_t)(now - listPrintAt) >= 0){
     listPrintAt=0; Serial.println("Last seen clients:");
     for (int i=0;i<32;i++) if (seen[i].name.length())
-      Serial.printf(" - %s  (%lus ago)\n", seen[i].name.c_str(), (unsigned long)((now - seen[i].ms)/1000));
+      Serial.printf(" - %s  boot=%lu  build=%s  (%lus ago)\n",
+        seen[i].name.c_str(),
+        (unsigned long)seen[i].bootCount,
+        (seen[i].build[0] ? seen[i].build : "-"),
+        (unsigned long)((now - seen[i].ms)/1000));
   }
 
   if (g.active && g.roundKind == RK_SHRINKING){

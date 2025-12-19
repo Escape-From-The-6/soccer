@@ -11,6 +11,10 @@ static bool ROLE_TOPLEFT=false, ROLE_TOPRIGHT=false, ROLE_SIDE=false;
 // ================= LEDs =================
 #define LED_PIN 23
 static uint16_t LED_COUNT=0;
+
+// Physical strip lengths (used by segment maps)
+static const uint16_t TOP_STRIP_PIXELS  = 184; // top LED strip total pixels
+static const uint16_t SIDE_STRIP_PIXELS = 107; // side LED strip total pixels (original mapping)
 Adafruit_NeoPixel* strip=nullptr;
 static const uint32_t FRAME_MIN_MS=25; // ~40 fps
 static uint32_t nextFrameAt=0;
@@ -33,6 +37,50 @@ static uint8_t rainbowPhase = 0;
 static bool espNowStarted=false;
 static void startEspNow(){ if(!espNowStarted){ wifiStaOnCh6(); if(nowInit()){ esp_now_register_recv_cb(nullptr); espNowStarted=true; }}}
 static void stopEspNow(){ if(espNowStarted){ esp_now_deinit(); espNowStarted=false; }}
+
+
+// ================= Boot HELLO (OTA verification) =================
+static uint32_t bootCount = 0;
+
+// Drip a few HELLOs at boot so the server reliably sees the reboot after OTA.
+static uint8_t  helloDripRemain = 0;
+static uint32_t helloNextAt     = 0;
+static const uint8_t  HELLO_DRIP_COUNT       = 5;
+static const uint16_t HELLO_DRIP_INTERVAL_MS = 120;
+
+
+// Optional: TopLeft sensor #14 GPIO override (helps if the 14th top sensor is wired to a different pin)
+// Stored in NVS under NVS_NS_DEV / NVS_KEY_TOP14PIN.
+static uint8_t nvsLoadTop14Pin(uint8_t defPin){
+  Preferences p; p.begin(NVS_NS_DEV, true);
+  uint8_t pin = (uint8_t)p.getUChar(NVS_KEY_TOP14PIN, defPin);
+  p.end();
+  return pin;
+}
+static void nvsSaveTop14Pin(uint8_t pin){
+  Preferences p; p.begin(NVS_NS_DEV, false);
+  p.putUChar(NVS_KEY_TOP14PIN, pin);
+  p.end();
+}
+
+static uint32_t nvsNextBootCount(){
+  Preferences p; p.begin(NVS_NS_DEV,false);
+  uint32_t b = p.getULong(NVS_KEY_BOOT, 0);
+  b++;
+  p.putULong(NVS_KEY_BOOT, b);
+  p.end();
+  return b;
+}
+
+static inline void sendHello(){
+  if(!espNowStarted) return;
+  HelloMsg hm{}; hm.h.kind=MSG_HELLO;
+  strncpy(hm.h.target,"ALL",sizeof(hm.h.target)-1);
+  strncpy(hm.name,deviceName.c_str(),sizeof(hm.name)-1);
+  hm.bootCount = bootCount;
+  snprintf(hm.build, sizeof(hm.build), "%s %s", __DATE__, __TIME__);
+  esp_now_send(BCAST,(uint8_t*)&hm,sizeof(hm));
+}
 
 // ================= Control Queues (WiFi/OTA/Name) =================
 static char qWifiSsid[32]={0}; static char qWifiPass[64]={0}; static volatile bool qWifiPending=false;
@@ -80,12 +128,22 @@ static inline void sendTrigger(uint8_t id, uint8_t gpio){
   esp_now_send(BCAST,(uint8_t*)&m,sizeof(m));
 }
 
-// TopLeft & Side: sensors 1..13
-static Sensor S_left_side[] = {
+// SIDE: sensors 1..13
+static Sensor S_side[] = {
   { 1,34,HIGH,HIGH,0,0},{ 2,35,HIGH,HIGH,0,0},{ 3,32,HIGH,HIGH,0,0},{ 4,33,HIGH,HIGH,0,0},
   { 5,25,HIGH,HIGH,0,0},{ 6,26,HIGH,HIGH,0,0},{ 7,27,HIGH,HIGH,0,0},{ 8,14,HIGH,HIGH,0,0},
   { 9,22,HIGH,HIGH,0,0},{10,13,HIGH,HIGH,0,0},{11,16,HIGH,HIGH,0,0},{12,17,HIGH,HIGH,0,0},
   {13,18,HIGH,HIGH,0,0}
+};
+
+// TOPLEFT: sensors 1..14
+// NOTE: sensor #14 pin is assumed to be IO23 (free on TopLeft because it has no LED strip).
+// If your wiring uses a different pin, change the pin number below.
+static Sensor S_topleft[] = {
+  { 1,34,HIGH,HIGH,0,0},{ 2,35,HIGH,HIGH,0,0},{ 3,32,HIGH,HIGH,0,0},{ 4,33,HIGH,HIGH,0,0},
+  { 5,25,HIGH,HIGH,0,0},{ 6,26,HIGH,HIGH,0,0},{ 7,27,HIGH,HIGH,0,0},{ 8,14,HIGH,HIGH,0,0},
+  { 9,22,HIGH,HIGH,0,0},{10,13,HIGH,HIGH,0,0},{11,16,HIGH,HIGH,0,0},{12,17,HIGH,HIGH,0,0},
+  {13,18,HIGH,HIGH,0,0},{14,23,HIGH,HIGH,0,0}
 };
 // TopRight: sensors 15..24
 static Sensor S_topright[] = {
@@ -98,15 +156,23 @@ static Sensor* S=nullptr; static uint8_t S_COUNT=0;
 // ================= Segment Maps =================
 struct Seg { uint16_t a,b; }; // inclusive
 static const Seg SIDE_MAP[14] = {
-  {0,0},{0,10},{11,18},{19,26},{27,33},{34,41},{42,49},{50,56},{57,64},{65,71},{72,79},{80,87},{88,94},{95,106}
+  // 0th entry unused (keeps 1-based indexing)
+  {0,0},
+  // Original side mapping (uneven physical spacing)
+  {0,10}, {11,18}, {19,26}, {27,33}, {34,41}, {42,49}, {50,56},
+  {57,64}, {65,71}, {72,79}, {80,87}, {88,94}, {95,106}
 };
-#define B(a,b) { (uint16_t)(183-(b)), (uint16_t)(183-(a)) }
-static const Seg TOP_MAP[24] = {
-  {0,0}, B(1,11),B(12,19),B(20,27),B(28,34),B(35,42),B(43,50),B(51,57),
-  B(58,65),B(66,72),B(73,80),B(81,88),B(89,95),B(96,103),B(104,110),B(111,118),
-  B(119,126),B(127,133),B(134,141),B(142,149),B(151,156),B(158,164),B(165,171),B(172,183)
+#define BR(a,b) { (uint16_t)((TOP_STRIP_PIXELS-1)-(b)), (uint16_t)((TOP_STRIP_PIXELS-1)-(a)) }
+static const Seg TOP_MAP[25] = {
+  // 0th entry unused (keeps 1-based sensor indexing)
+  {0,0},
+  BR(0,7),    BR(8,15),   BR(16,22),  BR(23,30),  BR(31,38),  BR(39,45),
+  BR(46,53),  BR(54,61),  BR(62,68),  BR(69,76),  BR(77,84),  BR(85,91),
+  BR(92,99),  BR(100,107),BR(108,114),BR(115,122),BR(123,130),BR(131,137),
+  BR(138,145),BR(146,153),BR(154,160),BR(161,168),BR(169,176),BR(177,183)
 };
-#undef B
+#undef BR
+
 
 // ===== Server-driven target bits =====
 // We will interpret these as target zones.
@@ -163,10 +229,24 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     }
     return;
   }
+  // Configure a sensor GPIO (used for TopLeft sensor #14 if needed)
+  if (h->kind == MSG_PIN_SET && len >= (int)sizeof(PinSetMsg)){
+    const PinSetMsg* m=(const PinSetMsg*)data;
+    if(!nameMatches(m->h.target,deviceName)) return;
+
+    // Only TopLeft uses sensor 14 in our wiring split (1..14 on TopLeft, 15..24 on TopRight).
+    if (ROLE_TOPLEFT && m->sensor_id == 14){
+      if (m->gpio > 0 && m->gpio <= 39){
+        nvsSaveTop14Pin(m->gpio);
+        delay(150);
+        ESP.restart();
+      }
+    }
+    return;
+  }
+
   if (h->kind == MSG_HELLO_REQ){
-    HelloMsg hm{}; hm.h.kind=MSG_HELLO; strncpy(hm.h.target,"ALL",sizeof(hm.h.target)-1);
-    strncpy(hm.name,deviceName.c_str(),sizeof(hm.name)-1);
-    esp_now_send(BCAST,(uint8_t*)&hm,sizeof(hm));
+    sendHello();
     return;
   }
 
@@ -222,6 +302,14 @@ static void renderFrame(){
   if (LED_COUNT==0 || strip==nullptr) return;
 
   uint32_t now = millis();
+
+  // Continue HELLO drip (useful after OTA reboot)
+  if (espNowStarted && helloDripRemain && (int32_t)(now - helloNextAt) >= 0){
+    sendHello();
+    helloDripRemain--;
+    helloNextAt = now + HELLO_DRIP_INTERVAL_MS;
+  }
+
   if (lifeFlashActive && now >= lifeFlashUntil){
     lifeFlashActive = false;
   }
@@ -290,7 +378,7 @@ static void renderFrame(){
 
     if (bonusRoundActive && any){
       // BONUS: rainbow targets, no penalty coloring
-      for (int id=1; id<=23; ++id){
+      for (int id=1; id<=24; ++id){
         if (!bitIsSet(bits, id)) continue;
         Seg s = TOP_MAP[id];
         for (uint16_t p=s.a; p<=s.b && p<LED_COUNT; ++p){
@@ -300,7 +388,7 @@ static void renderFrame(){
       }
     } else if (!penaltyMode || !any){
       // Normal: only targets are green
-      for (int id=1; id<=23; ++id){
+      for (int id=1; id<=24; ++id){
         if (!bitIsSet(bits, id)) continue;
         Seg s = TOP_MAP[id];
         for (uint16_t p=s.a; p<=s.b && p<LED_COUNT; ++p){
@@ -309,7 +397,7 @@ static void renderFrame(){
       }
     } else {
       // Penalty mode: active arena -> non-target = RED, target = GREEN
-      for (int id=1; id<=23; ++id){
+      for (int id=1; id<=24; ++id){
         Seg s = TOP_MAP[id];
         bool isTarget = bitIsSet(bits, id);
         uint32_t color = isTarget ? strip->Color(0,255,0) : strip->Color(255,0,0);
@@ -332,12 +420,39 @@ void setup(){
   ROLE_TOPRIGHT = deviceName.equalsIgnoreCase("Soccer-topright");
   ROLE_SIDE     = deviceName.equalsIgnoreCase("Soccer-side");
 
-  if (ROLE_TOPRIGHT){
-    S=S_topright; S_COUNT=sizeof(S_topright)/sizeof(S_topright[0]); LED_COUNT=183;
+  bootCount = nvsNextBootCount();
+
+  // If this is the TopLeft board, allow sensor #14 pin to be overridden from NVS.
+  // This helps if the "11th from the right" top sensor is wired to a different GPIO.
+  if (ROLE_TOPLEFT){
+    uint8_t p14 = nvsLoadTop14Pin(23); // default is 23 unless overridden
+    for (uint8_t i=0;i<sizeof(S_topleft)/sizeof(S_topleft[0]); ++i){
+      if (S_topleft[i].id == 14){
+        S_topleft[i].pin = p14;
+      }
+    }
+    Serial.printf("[PIN] TopLeft sensor14 GPIO=%u (override via server PIN cmd)\n", (unsigned)p14);
   }
-  else{
-    S=S_left_side; S_COUNT=sizeof(S_left_side)/sizeof(S_left_side[0]);
-    LED_COUNT = ROLE_SIDE ? 107 : 0;
+
+
+
+  if (ROLE_TOPRIGHT){
+    S = S_topright;
+    S_COUNT = sizeof(S_topright)/sizeof(S_topright[0]);
+    LED_COUNT = TOP_STRIP_PIXELS;
+  } else if (ROLE_SIDE){
+    S = S_side;
+    S_COUNT = sizeof(S_side)/sizeof(S_side[0]);
+    LED_COUNT = SIDE_STRIP_PIXELS;
+  } else if (ROLE_TOPLEFT){
+    S = S_topleft;
+    S_COUNT = sizeof(S_topleft)/sizeof(S_topleft[0]);
+    LED_COUNT = 0;
+  } else {
+    // Fallback: sensors-only (helps bring up generic boards without LEDs)
+    S = S_side;
+    S_COUNT = sizeof(S_side)/sizeof(S_side[0]);
+    LED_COUNT = 0;
   }
 
   for (uint8_t i=0;i<S_COUNT;i++){
@@ -358,8 +473,10 @@ void setup(){
   startEspNow();
   esp_now_register_recv_cb(onNowRecv);
 
-  HelloMsg hm{}; hm.h.kind=MSG_HELLO; strncpy(hm.h.target,"ALL",sizeof(hm.h.target)-1);
-  strncpy(hm.name,deviceName.c_str(),sizeof(hm.name)-1); esp_now_send(BCAST,(uint8_t*)&hm,sizeof(hm));
+  // HELLO at boot (drip a few times for reliability)
+  sendHello();
+  helloDripRemain = (HELLO_DRIP_COUNT>0) ? (HELLO_DRIP_COUNT-1) : 0;
+  helloNextAt = millis() + HELLO_DRIP_INTERVAL_MS;
 
   Serial.printf("Boot %s  (role: %s)  LEDs=%u on IO%d\n",
     deviceName.c_str(),
