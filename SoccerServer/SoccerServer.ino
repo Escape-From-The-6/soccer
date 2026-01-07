@@ -1,6 +1,72 @@
 #include "SoccerCommon.h"
 #include <esp_system.h>
 #include <stddef.h>
+// =============================================================
+// Soccer Shootout ESP-NOW Server
+//
+// With standardized serial protocol for the main Player Management System (PMS)
+//
+// Standard protocol lines always start with:
+//   !PMS
+//
+// PMS protocol (v1) ***DO NOT REMOVE***:
+//   PMS -> Server:
+//     !PMS PING
+//     !PMS START level=1        (level 1..4; default 1)
+//     !PMS STOP
+//
+//   Server -> PMS:
+//     !PMS PONG v=1 game=soccer role=server
+//     !PMS STATUS v=1 state=arming|playing level=.. score=.. lives=.. tleft_ms=.. last_reason=..
+//       (STATUS prints every 250ms while arming/playing; STATUS is NOT emitted while idle)
+//     !PMS EVENT v=1 name=game_start level=..
+//     !PMS EVENT v=1 name=game_end reason=timeup|no_lives|stopped score=.. lives=..
+//     !PMS EVENT v=1 name=score delta=.. total=.. bonus=0|1
+//     !PMS EVENT v=1 name=life delta=-1 lives=..
+//
+// Build toggles (compile-time):
+//   - PMS_STD_ENABLED: enable/disable PMS protocol support
+//   - PMS_DEBUG_SERIAL: when 0, suppress non-!PMS Serial prints (keep PMS clean)
+// =============================================================
+//
+// Notes:
+// - `state=arming` is used during the Warmup round (RK_WARMUP). All other rounds use `state=playing`.
+// - `tleft_ms` is time remaining in the *current round* (Warmup/HitAll/Shrink/Bonus).
+// - `bonus=1` is emitted for score events during the BONUS round (RK_BONUS_MOVING), else 0.
+//   (Bonus round score increment is SOCCER_BONUS_SCORE_DELTA, default 2.)
+// =============================================================
+
+#ifndef PMS_STD_ENABLED
+#define PMS_STD_ENABLED 1
+#endif
+
+#ifndef PMS_DEBUG_SERIAL
+#define PMS_DEBUG_SERIAL 1
+#endif
+
+#ifndef PMS_STATUS_PERIOD_MS
+#define PMS_STATUS_PERIOD_MS 250
+#endif
+
+
+#ifndef SOCCER_BONUS_SCORE_DELTA
+#define SOCCER_BONUS_SCORE_DELTA 2
+#endif
+#if PMS_DEBUG_SERIAL
+  #define DBG_PRINT(...)    Serial.print(__VA_ARGS__)
+  #define DBG_PRINTLN(...)  Serial.println(__VA_ARGS__)
+  #define DBG_PRINTF(...)   Serial.printf(__VA_ARGS__)
+#else
+  #define DBG_PRINT(...)    do { } while (0)
+  #define DBG_PRINTLN(...)  do { } while (0)
+  #define DBG_PRINTF(...)   do { } while (0)
+#endif
+
+// PMS output is NEVER suppressed by PMS_DEBUG_SERIAL.
+#define PMS_PRINT(...)    Serial.print(__VA_ARGS__)
+#define PMS_PRINTLN(...)  Serial.println(__VA_ARGS__)
+#define PMS_PRINTF(...)   Serial.printf(__VA_ARGS__)
+
 
 static String myName = "Soccer-server";
 
@@ -553,7 +619,7 @@ static void loseLifeAndRestart(const char* reason){
   // Global hit grace: a life-loss is also a "hit event"
   lastHitGlobalMs = millis();
 
-  Serial.printf("[L%uR%u] %s -> life lost, lives=%u (score=%lu)\n",
+  DBG_PRINTF("[L%uR%u] %s -> life lost, lives=%u (score=%lu)\n",
     (unsigned)g.levelIndex,
     (unsigned)(g.roundIndex+1),
     reason ? reason : "life-loss",
@@ -563,7 +629,7 @@ static void loseLifeAndRestart(const char* reason){
   sendLifeFlash(300);
 
   if (g.lives == 0){
-    Serial.printf("[L%uR%u] out of lives, ending game.\n",
+    DBG_PRINTF("[L%uR%u] out of lives, ending game.\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1));
     g.active = false;
@@ -582,7 +648,7 @@ static void loseLifeOnly(const char* reason){
   // Global hit grace
   lastHitGlobalMs = millis();
 
-  Serial.printf("[L%uR%u] %s -> life lost (no restart), lives=%u (score=%lu)\n",
+  DBG_PRINTF("[L%uR%u] %s -> life lost (no restart), lives=%u (score=%lu)\n",
     (unsigned)g.levelIndex,
     (unsigned)(g.roundIndex+1),
     reason ? reason : "life-loss",
@@ -592,7 +658,7 @@ static void loseLifeOnly(const char* reason){
   sendLifeFlash(300);
 
   if (g.lives == 0){
-    Serial.printf("[L%uR%u] out of lives, ending game.\n",
+    DBG_PRINTF("[L%uR%u] out of lives, ending game.\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1));
     g.active = false;
@@ -630,7 +696,7 @@ static void onRoundCleared(){
 
   uint8_t nextRound = g.roundIndex + 1;
   if (nextRound < g.level->numRounds){
-    Serial.printf("[L%uR%u] round cleared, advancing to R%u\n",
+    DBG_PRINTF("[L%uR%u] round cleared, advancing to R%u\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1),
       (unsigned)(nextRound+1));
@@ -645,19 +711,19 @@ static void onRoundCleared(){
 
 static void finishLevelAdvance(){
   if (g.levelIndex == 1){
-    Serial.printf("[L1] complete, advancing to Level 2 (score=%lu, lives=%u)\n",
+    DBG_PRINTF("[L1] complete, advancing to Level 2 (score=%lu, lives=%u)\n",
       (unsigned long)g.score, (unsigned)g.lives);
     startLevel(2, false);
   } else if (g.levelIndex == 2){
-    Serial.printf("[L2] complete, advancing to Level 3 (score=%lu, lives=%u)\n",
+    DBG_PRINTF("[L2] complete, advancing to Level 3 (score=%lu, lives=%u)\n",
       (unsigned long)g.score, (unsigned)g.lives);
     startLevel(3, false);
   } else if (g.levelIndex == 3){
-    Serial.printf("[L3] complete, advancing to Level 4 (score=%lu, lives=%u)\n",
+    DBG_PRINTF("[L3] complete, advancing to Level 4 (score=%lu, lives=%u)\n",
       (unsigned long)g.score, (unsigned)g.lives);
     startLevel(4, false);
   } else if (g.levelIndex == 4){
-    Serial.printf("[L4] complete, game finished. final score=%lu lives=%u\n",
+    DBG_PRINTF("[L4] complete, game finished. final score=%lu lives=%u\n",
       (unsigned long)g.score, (unsigned)g.lives);
     g.active = false;
     clearTargets();
@@ -674,7 +740,7 @@ static void onShrinkCleared(){
     uint8_t nextRound = g.roundIndex + 1;
     if (nextRound < g.level->numRounds &&
         g.level->rounds[nextRound] == RK_BONUS_MOVING){
-      Serial.printf("[L%uR%u] shrinking round cleared, starting BONUS round R%u\n",
+      DBG_PRINTF("[L%uR%u] shrinking round cleared, starting BONUS round R%u\n",
         (unsigned)g.levelIndex,
         (unsigned)(g.roundIndex+1),
         (unsigned)(nextRound+1));
@@ -694,7 +760,7 @@ static void onBonusCleared(){
   // Extra safety: explicitly tell clients bonus is over
   sendRoundInfo(false);
 
-  Serial.printf("[L%uR%u] BONUS round complete (score=%lu, lives=%u)\n",
+  DBG_PRINTF("[L%uR%u] BONUS round complete (score=%lu, lives=%u)\n",
     (unsigned)g.levelIndex,
     (unsigned)(g.roundIndex+1),
     (unsigned long)g.score,
@@ -758,7 +824,7 @@ static void startRound(uint8_t roundIdx){
     rebuildTargetsFromBlocks();
     nextLedPushAt = now + LED_PUSH_MIN_MS;
 
-    Serial.printf("[L%uR1] start Warmup arena=%s block %u/%u ids=%u..%u dur=%lus\n",
+    DBG_PRINTF("[L%uR1] start Warmup arena=%s block %u/%u ids=%u..%u dur=%lus\n",
       (unsigned)g.levelIndex,
       (g.arena==ARENA_TOP?"TOP":"SIDE"),
       (unsigned)(g.activeBlock+1),
@@ -787,7 +853,7 @@ static void startRound(uint8_t roundIdx){
     rebuildTargetsFromBlocks();
     nextLedPushAt = now + LED_PUSH_MIN_MS;
 
-    Serial.printf("[L%uR%u] start HitAll A arena=%s blocks=%u dur=%lus\n",
+    DBG_PRINTF("[L%uR%u] start HitAll A arena=%s blocks=%u dur=%lus\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1),
       (g.arena==ARENA_TOP?"TOP":"SIDE"),
@@ -815,7 +881,7 @@ static void startRound(uint8_t roundIdx){
     rebuildTargetsFromBlocks();
     nextLedPushAt = now + LED_PUSH_MIN_MS;
 
-    Serial.printf("[L%uR%u] start HitAll B arena=%s blocks=%u dur=%lus\n",
+    DBG_PRINTF("[L%uR%u] start HitAll B arena=%s blocks=%u dur=%lus\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1),
       (g.arena==ARENA_TOP?"TOP":"SIDE"),
@@ -839,7 +905,7 @@ static void startRound(uint8_t roundIdx){
     updateShrinkingTargets();
     nextLedPushAt = now + LED_PUSH_MIN_MS;
 
-    Serial.printf("[L%uR%u] start Shrinking arena=%s center=%u dur=%lus (widths=%u,%u,%u)\n",
+    DBG_PRINTF("[L%uR%u] start Shrinking arena=%s center=%u dur=%lus (widths=%u,%u,%u)\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1),
       (g.arena==ARENA_TOP?"TOP":"SIDE"),
@@ -878,7 +944,7 @@ static void startRound(uint8_t roundIdx){
     }
     nextLedPushAt = now + LED_PUSH_MIN_MS;
 
-    Serial.printf("[L%uR%u] start BONUS sliding arena=%s center=%u width=%u dur=%lus\n",
+    DBG_PRINTF("[L%uR%u] start BONUS sliding arena=%s center=%u width=%u dur=%lus\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1),
       (g.arena==ARENA_TOP?"TOP":"SIDE"),
@@ -912,7 +978,7 @@ static void startLevel(uint8_t levelIndex, bool resetScoreAndLives){
 
   sendMode(g.penaltyMode);
 
-  Serial.printf("[GAME] start Level %u  penalty=%s  lives=%u  score=%lu\n",
+  DBG_PRINTF("[GAME] start Level %u  penalty=%s  lives=%u  score=%lu\n",
     (unsigned)g.levelIndex,
     g.penaltyMode ? "YES" : "NO",
     (unsigned)g.lives,
@@ -954,7 +1020,7 @@ static void handleSensorEvent(const SensorEventMsg* m){
       setSideBit(id);
     }
     nextLedPushAt = now;
-    Serial.printf("[TEST] %s arena=%s sensor=%u\n",
+    DBG_PRINTF("[TEST] %s arena=%s sensor=%u\n",
       m->name,
       (eventArena==ARENA_TOP ? "TOP" : "SIDE"),
       (unsigned)id);
@@ -1002,7 +1068,7 @@ static void handleSensorEvent(const SensorEventMsg* m){
     // Global hit grace
     lastHitGlobalMs = now;
 
-    Serial.printf("[L%uR%u] HIT (SHRINKING) arena=%s sensor=%u stage=%u hits=%u score=%lu\n",
+    DBG_PRINTF("[L%uR%u] HIT (SHRINKING) arena=%s sensor=%u stage=%u hits=%u score=%lu\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1),
       (eventArena==ARENA_TOP ? "TOP" : "SIDE"),
@@ -1038,12 +1104,12 @@ static void handleSensorEvent(const SensorEventMsg* m){
       return;
     }
 
-    g.score++;
+    g.score += SOCCER_BONUS_SCORE_DELTA;
 
     // Global hit grace
     lastHitGlobalMs = now;
 
-    Serial.printf("[L%uR%u] HIT (BONUS) arena=%s sensor=%u score=%lu\n",
+    DBG_PRINTF("[L%uR%u] HIT (BONUS) arena=%s sensor=%u score=%lu\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1),
       (eventArena==ARENA_TOP ? "TOP" : "SIDE"),
@@ -1104,7 +1170,7 @@ static void handleSensorEvent(const SensorEventMsg* m){
     rebuildTargetsFromBlocks();
     nextLedPushAt   = now;
 
-    Serial.printf("[L%uR1] HIT arena=%s sensor=%u score=%lu nextBlock=%u/%u\n",
+    DBG_PRINTF("[L%uR1] HIT arena=%s sensor=%u score=%lu nextBlock=%u/%u\n",
       (unsigned)g.levelIndex,
       (eventArena==ARENA_TOP ? "TOP" : "SIDE"),
       (unsigned)id,
@@ -1152,7 +1218,7 @@ static void handleSensorEvent(const SensorEventMsg* m){
       // Global hit grace
       lastHitGlobalMs = now;
 
-      Serial.printf("[L%uR%u] HIT arena=%s block=%u/%u sensor=%u (graceDist=%u) score=%lu\n",
+      DBG_PRINTF("[L%uR%u] HIT arena=%s block=%u/%u sensor=%u (graceDist=%u) score=%lu\n",
         (unsigned)g.levelIndex,
         (unsigned)(g.roundIndex+1),
         (eventArena==ARENA_TOP ? "TOP" : "SIDE"),
@@ -1224,7 +1290,7 @@ if (h->kind == MSG_HELLO && len >= HELLO_V1_SIZE){
 
   bool shouldPrint = rememberHello(m->name, boot, build);
   if (shouldPrint){
-    Serial.printf("[HELLO] %s  boot=%lu  build=%s\n",
+    DBG_PRINTF("[HELLO] %s  boot=%lu  build=%s\n",
       m->name, (unsigned long)boot, build);
   }
 
@@ -1239,7 +1305,7 @@ if (h->kind == MSG_HELLO && len >= HELLO_V1_SIZE){
   if (h->kind == MSG_SENSOR_EVENT && len >= (int)sizeof(SensorEventMsg)){
     const SensorEventMsg* m=(const SensorEventMsg*)data;
     handleSensorEvent(m);
-    Serial.printf("[EVT] %s s%u gpio%u state=%u seq=%u\n",
+    DBG_PRINTF("[EVT] %s s%u gpio%u state=%u seq=%u\n",
       m->name, m->sensor_id, m->gpio, m->state, m->seq);
     return;
   }
@@ -1247,59 +1313,215 @@ if (h->kind == MSG_HELLO && len >= HELLO_V1_SIZE){
 
 // ========== CLI ==========
 static void printCfg(){
-  Serial.println("Config:");
-  Serial.printf("  R1DUR = %lu ms\n", (unsigned long)cfg.r1DurationMs);
-  Serial.printf("  R2DUR = %lu ms\n", (unsigned long)cfg.r2DurationMs);
-  Serial.printf("  R3DUR = %lu ms\n", (unsigned long)cfg.r3DurationMs);
-  Serial.printf("  R4DUR = %lu ms\n", (unsigned long)cfg.r4DurationMs);
-  Serial.printf("  L1TOP = %u blocks\n", cfg.topBlocks);
-  Serial.printf("  L1SIDE= %u blocks\n", cfg.sideBlocks);
-  Serial.printf("  L2TOP = %u blocks (fixed)\n", (unsigned)L2_TOP_BLOCKS);
-  Serial.printf("  L2SIDE= %u blocks (fixed)\n", (unsigned)L2_SIDE_BLOCKS);
-  Serial.printf("  REARM = %lu ms\n", (unsigned long)cfg.scoreRearmMs);
-  Serial.printf("  GRACE = %lu ms\n", (unsigned long)cfg.roundChangeGraceMs);
-  Serial.printf("  GRACE_TOP_SENSORS  = %u\n", (unsigned)graceTopSensors);
-  Serial.printf("  GRACE_SIDE_SENSORS = %u\n", (unsigned)graceSideSensors);
-  Serial.printf("  BONUS = %lu ms\n", (unsigned long)BONUS_DURATION_MS);
-  Serial.println();
+  DBG_PRINTLN("Config:");
+  DBG_PRINTF("  R1DUR = %lu ms\n", (unsigned long)cfg.r1DurationMs);
+  DBG_PRINTF("  R2DUR = %lu ms\n", (unsigned long)cfg.r2DurationMs);
+  DBG_PRINTF("  R3DUR = %lu ms\n", (unsigned long)cfg.r3DurationMs);
+  DBG_PRINTF("  R4DUR = %lu ms\n", (unsigned long)cfg.r4DurationMs);
+  DBG_PRINTF("  L1TOP = %u blocks\n", cfg.topBlocks);
+  DBG_PRINTF("  L1SIDE= %u blocks\n", cfg.sideBlocks);
+  DBG_PRINTF("  L2TOP = %u blocks (fixed)\n", (unsigned)L2_TOP_BLOCKS);
+  DBG_PRINTF("  L2SIDE= %u blocks (fixed)\n", (unsigned)L2_SIDE_BLOCKS);
+  DBG_PRINTF("  REARM = %lu ms\n", (unsigned long)cfg.scoreRearmMs);
+  DBG_PRINTF("  GRACE = %lu ms\n", (unsigned long)cfg.roundChangeGraceMs);
+  DBG_PRINTF("  GRACE_TOP_SENSORS  = %u\n", (unsigned)graceTopSensors);
+  DBG_PRINTF("  GRACE_SIDE_SENSORS = %u\n", (unsigned)graceSideSensors);
+  DBG_PRINTF("  BONUS = %lu ms\n", (unsigned long)BONUS_DURATION_MS);
+  DBG_PRINTLN();
 }
 
 static void printHelp(){
-  Serial.println();
-  Serial.println("=== Soccer Server CLI ===");
-  Serial.println("WIFI ALL <ssid> <pass>");
-  Serial.println("WIFI <name> <ssid> <pass>");
-  Serial.println("OTA ALL <url>");
-  Serial.println("OTA <name> <url>");
-  Serial.println("NAME <ALL|currentName> <newName>");
-  Serial.println("PIN <name> <sensorId> <gpio>  (configure client sensor GPIO; ex: PIN Soccer-topleft 14 19)");
-  Serial.println("LIST");
-  Serial.println("GAME START   (Level 1)");
-  Serial.println("GAME L1      (Level 1)");
-  Serial.println("GAME L2      (Level 2)");
-  Serial.println("GAME L3      (Level 3 - penalty mode, layout 1, WITH warmup + bonus)");
-  Serial.println("GAME L4      (Level 4 - penalty mode, layout 2, WITH warmup + bonus)");
-  Serial.println("GAME STOP");
-  Serial.println("TEST ON     (sensor -> LED mapping test mode)");
-  Serial.println("TEST OFF");
-  Serial.println("TEST CLEAR  (turn all targets off while staying in TEST mode)");
-  Serial.println("TEST TOP <id>   (force a top segment to light)");
-  Serial.println("TEST SIDE <id>  (force a side segment to light)");
-  Serial.println("CFG");
-  Serial.println("SET <R1DUR|R2DUR|R3DUR|R4DUR|L1TOP|L1SIDE|REARM|GRACE|TOPGRACE|SIDEGRACE> <value>");
-  Serial.println();
-  Serial.println("Examples:");
-  Serial.println("  WIFI ALL AndrewiPhone 12345678");
-  Serial.println("  OTA ALL http://172.20.10.3:8000/Soccer/SoccerClient/build/esp32.esp32.esp32/SoccerClient.ino.bin");
-  Serial.println("  GAME START");
-  Serial.println("  GAME L3");
-  Serial.println("===========================");
+  DBG_PRINTLN();
+  DBG_PRINTLN("=== Soccer Server CLI ===");
+  DBG_PRINTLN("WIFI ALL <ssid> <pass>");
+  DBG_PRINTLN("WIFI <name> <ssid> <pass>");
+  DBG_PRINTLN("OTA ALL <url>");
+  DBG_PRINTLN("OTA <name> <url>");
+  DBG_PRINTLN("NAME <ALL|currentName> <newName>");
+  DBG_PRINTLN("PIN <name> <sensorId> <gpio>  (configure client sensor GPIO; ex: PIN Soccer-topleft 14 19)");
+  DBG_PRINTLN("LIST");
+  DBG_PRINTLN("GAME START   (Level 1)");
+  DBG_PRINTLN("GAME L1      (Level 1)");
+  DBG_PRINTLN("GAME L2      (Level 2)");
+  DBG_PRINTLN("GAME L3      (Level 3 - penalty mode, layout 1, WITH warmup + bonus)");
+  DBG_PRINTLN("GAME L4      (Level 4 - penalty mode, layout 2, WITH warmup + bonus)");
+  DBG_PRINTLN("GAME STOP");
+  DBG_PRINTLN("TEST ON     (sensor -> LED mapping test mode)");
+  DBG_PRINTLN("TEST OFF");
+  DBG_PRINTLN("TEST CLEAR  (turn all targets off while staying in TEST mode)");
+  DBG_PRINTLN("TEST TOP <id>   (force a top segment to light)");
+  DBG_PRINTLN("TEST SIDE <id>  (force a side segment to light)");
+  DBG_PRINTLN("CFG");
+  DBG_PRINTLN("SET <R1DUR|R2DUR|R3DUR|R4DUR|L1TOP|L1SIDE|REARM|GRACE|TOPGRACE|SIDEGRACE> <value>");
+  DBG_PRINTLN();
+  DBG_PRINTLN("Examples:");
+  DBG_PRINTLN("  WIFI ALL AndrewiPhone 12345678");
+  DBG_PRINTLN("  OTA ALL http://172.20.10.3:8000/Soccer/SoccerClient/build/esp32.esp32.esp32/SoccerClient.ino.bin");
+  DBG_PRINTLN("  GAME START");
+  DBG_PRINTLN("  GAME L3");
+  DBG_PRINTLN("===========================");
 }
+
+
+// ========== PMS v1 (!PMS) Standard Serial Protocol ==========
+// NOTE: PMS output lines always start with "!PMS" and are NEVER suppressed by PMS_DEBUG_SERIAL.
+static bool pmsStopRequested = false;
+
+#if PMS_STD_ENABLED
+
+static int32_t pmsParseKeyInt(const String& args, const char* key, int32_t defaultVal){
+  String pattern = String(key) + "=";
+  int idx = args.indexOf(pattern);
+  if (idx < 0) return defaultVal;
+
+  idx += pattern.length();
+  int end = idx;
+  while (end < (int)args.length()){
+    char c = args.charAt(end);
+    if (c==' ' || c=='\t' || c=='\r' || c=='\n') break;
+    end++;
+  }
+  String val = args.substring(idx, end);
+  val.trim();
+  if (!val.length()) return defaultVal;
+  return val.toInt();
+}
+
+static String pmsFirstToken(const String& s){
+  int sp = s.indexOf(' ');
+  if (sp < 0) return s;
+  return s.substring(0, sp);
+}
+
+static String pmsAfterFirstToken(const String& s){
+  int sp = s.indexOf(' ');
+  if (sp < 0) return "";
+  return s.substring(sp + 1);
+}
+
+static const char* pmsStateStr(){
+  // Soccer uses Warmup round as "arming"
+  if (!g.active) return "idle";
+  if (g.roundKind == RK_WARMUP) return "arming";
+  return "playing";
+}
+
+static void pmsPrintPong(){
+  PMS_PRINTLN("!PMS PONG v=1 game=soccer role=server");
+}
+
+static void pmsPrintEventGameStart(uint8_t level){
+  PMS_PRINT("!PMS EVENT v=1 name=game_start level=");
+  PMS_PRINTLN(level);
+}
+
+static void pmsPrintEventGameEnd(const char* reason, uint32_t score, uint8_t lives){
+  PMS_PRINT("!PMS EVENT v=1 name=game_end reason=");
+  PMS_PRINT(reason);
+  PMS_PRINT(" score=");
+  PMS_PRINT(score);
+  PMS_PRINT(" lives=");
+  PMS_PRINTLN(lives);
+}
+
+static void pmsPrintEventScore(int32_t delta, uint32_t total, bool bonus){
+  PMS_PRINT("!PMS EVENT v=1 name=score delta=");
+  PMS_PRINT(delta);
+  PMS_PRINT(" total=");
+  PMS_PRINT(total);
+  PMS_PRINT(" bonus=");
+  PMS_PRINTLN(bonus ? 1 : 0);
+}
+
+static void pmsPrintEventLife(int32_t delta, uint8_t lives){
+  PMS_PRINT("!PMS EVENT v=1 name=life delta=");
+  PMS_PRINT(delta);
+  PMS_PRINT(" lives=");
+  PMS_PRINTLN(lives);
+}
+
+static void pmsPrintStatus(const char* state, uint8_t level, uint32_t score, uint8_t lives, uint32_t tleftMs, const char* lastReason){
+  PMS_PRINT("!PMS STATUS v=1 state=");
+  PMS_PRINT(state);
+  PMS_PRINT(" level=");
+  PMS_PRINT(level);
+  PMS_PRINT(" score=");
+  PMS_PRINT(score);
+  PMS_PRINT(" lives=");
+  PMS_PRINT(lives);
+  PMS_PRINT(" tleft_ms=");
+  PMS_PRINT(tleftMs);
+  PMS_PRINT(" last_reason=");
+  PMS_PRINTLN(lastReason);
+}
+
+// PMS input:
+//   !PMS PING
+//   !PMS START level=1
+//   !PMS STOP
+static void handlePmsLine(const String& rawLine){
+  String line = rawLine;
+  line.trim();
+  if (!line.startsWith("!PMS")) return;
+
+  String rest = line.substring(4);
+  rest.trim();
+  if (!rest.length()) return;
+
+  String kind = pmsFirstToken(rest);
+  String args = pmsAfterFirstToken(rest);
+  kind.toUpperCase();
+
+  if (kind == "PING"){
+    pmsPrintPong();
+    return;
+  }
+
+  if (kind == "START"){
+    int32_t level = pmsParseKeyInt(args, "level", 1);
+    if (level < 1) level = 1;
+    if (level > 4) level = 4;
+
+    // Ignore START if already active (helps PMS retries without restarting the game).
+    if (g.active) return;
+
+    // Ensure we are not in TEST mode when starting a real game.
+    testMode = false;
+
+    // Reset "manual stop" flag for a new run.
+    pmsStopRequested = false;
+
+    g.active = true;
+    startLevel((uint8_t)level, true);
+    return;
+  }
+
+  if (kind == "STOP"){
+    if (!g.active) return;
+
+    pmsStopRequested = true;
+
+    g.active = false;
+    clearTargets();
+    pushLedStates();
+    return;
+  }
+
+  // Unknown PMS command: stay silent in production; log only in debug builds.
+  DBG_PRINT("Unknown PMS command: ");
+  DBG_PRINTLN(rawLine);
+}
+
+#endif // PMS_STD_ENABLED
 
 static void handleSerialServer(){
   if (!Serial.available()) return;
   String line = Serial.readStringUntil('\n'); line.trim();
   if (!line.length()) return;
+
+#if PMS_STD_ENABLED
+  if (line.startsWith("!PMS")){ handlePmsLine(line); return; }
+#endif
 
   String norm; norm.reserve(line.length()); bool sp=false;
   for (size_t i=0;i<line.length();++i){
@@ -1330,39 +1552,39 @@ static void handleSerialServer(){
   if (cmd=="LIST"){
     helloDripActive=true; helloDripRemain=HELLO_DRIP_COUNT;
     helloNextAt=millis(); listPrintAt=0;
-    Serial.println("Requesting HELLOs (drip)...");
+    DBG_PRINTLN("Requesting HELLOs (drip)...");
     return;
   }
   if (cmd=="WIFI"){
-    if(!arg1.length()){Serial.println("Usage: WIFI <ALL|name> <ssid> <pass>");return;}
+    if(!arg1.length()){DBG_PRINTLN("Usage: WIFI <ALL|name> <ssid> <pass>");return;}
     int sp=rest.indexOf(' ');
-    if(sp<0){Serial.println("Usage: WIFI <ALL|name> <ssid> <pass>");return;}
+    if(sp<0){DBG_PRINTLN("Usage: WIFI <ALL|name> <ssid> <pass>");return;}
     String ssid=rest.substring(0,sp), pass=rest.substring(sp+1); ssid.trim(); pass.trim();
-    if(!ssid.length()||!pass.length()){Serial.println("Usage: WIFI <ALL|name> <ssid> <pass>");return;}
+    if(!ssid.length()||!pass.length()){DBG_PRINTLN("Usage: WIFI <ALL|name> <ssid> <pass>");return;}
     sendWifiSet(arg1.c_str(),ssid,pass);
-    Serial.printf("Sent WIFI_SET to %s (ssid=%s)\n",arg1.c_str(),ssid.c_str());
+    DBG_PRINTF("Sent WIFI_SET to %s (ssid=%s)\n",arg1.c_str(),ssid.c_str());
     return;
   }
   if (cmd=="OTA"){
-    if(!arg1.length()||!rest.length()){Serial.println("Usage: OTA <ALL|name> <url>"); return;}
+    if(!arg1.length()||!rest.length()){DBG_PRINTLN("Usage: OTA <ALL|name> <url>"); return;}
     sendOta(arg1.c_str(),rest);
-    Serial.printf("Sent OTA_TRIGGER to %s  url=%s\n",arg1.c_str(),rest.c_str());
+    DBG_PRINTF("Sent OTA_TRIGGER to %s  url=%s\n",arg1.c_str(),rest.c_str());
     return;
   }
   if (cmd=="NAME"){
-    if(!arg1.length()||!rest.length()){Serial.println("Usage: NAME <ALL|currentName> <newName>");return;}
+    if(!arg1.length()||!rest.length()){DBG_PRINTLN("Usage: NAME <ALL|currentName> <newName>");return;}
     sendNameSet(arg1.c_str(),rest);
-    Serial.printf("Sent NAME_SET to %s -> %s\n",arg1.c_str(),rest.c_str());
+    DBG_PRINTF("Sent NAME_SET to %s -> %s\n",arg1.c_str(),rest.c_str());
     return;
   }
   if (cmd=="PIN"){
     if(!arg1.length()||!rest.length()){
-      Serial.println("Usage: PIN <name> <sensorId> <gpio>");
+      DBG_PRINTLN("Usage: PIN <name> <sensorId> <gpio>");
       return;
     }
     int sp=rest.indexOf(' ');
     if(sp<0){
-      Serial.println("Usage: PIN <name> <sensorId> <gpio>");
+      DBG_PRINTLN("Usage: PIN <name> <sensorId> <gpio>");
       return;
     }
     String sIdStr = rest.substring(0,sp); sIdStr.trim();
@@ -1370,27 +1592,29 @@ static void handleSerialServer(){
     int sid  = sIdStr.toInt();
     int gpio = gpioStr.toInt();
     if (sid < 1 || sid > 32){
-      Serial.println("sensorId must be 1..32");
+      DBG_PRINTLN("sensorId must be 1..32");
       return;
     }
     if (gpio < 0 || gpio > 39){
-      Serial.println("gpio must be 0..39");
+      DBG_PRINTLN("gpio must be 0..39");
       return;
     }
     sendPinSet(arg1.c_str(), (uint8_t)sid, (uint8_t)gpio);
-    Serial.printf("Sent PIN_SET to %s  sensor=%d  gpio=%d\n", arg1.c_str(), sid, gpio);
+    DBG_PRINTF("Sent PIN_SET to %s  sensor=%d  gpio=%d\n", arg1.c_str(), sid, gpio);
     return;
   }
 
   if (cmd=="GAME"){
     if (!arg1.length()){
-      Serial.println("Usage: GAME START|L1|L2|L3|L4|STOP");
+      DBG_PRINTLN("Usage: GAME START|L1|L2|L3|L4|STOP");
       return;
     }
     if (arg1.equalsIgnoreCase("START") || arg1.equalsIgnoreCase("L1")){
       if (g.active){
-        Serial.println("Game already active. Use GAME STOP first.");
+        DBG_PRINTLN("Game already active. Use GAME STOP first.");
       } else {
+        testMode = false;
+        pmsStopRequested = false;
         g.active = true;
         startLevel(1, true);
       }
@@ -1398,8 +1622,10 @@ static void handleSerialServer(){
     }
     if (arg1.equalsIgnoreCase("L2")){
       if (g.active){
-        Serial.println("Game already active. Use GAME STOP first.");
+        DBG_PRINTLN("Game already active. Use GAME STOP first.");
       } else {
+        testMode = false;
+        pmsStopRequested = false;
         g.active = true;
         startLevel(2, true);
       }
@@ -1407,8 +1633,10 @@ static void handleSerialServer(){
     }
     if (arg1.equalsIgnoreCase("L3")){
       if (g.active){
-        Serial.println("Game already active. Use GAME STOP first.");
+        DBG_PRINTLN("Game already active. Use GAME STOP first.");
       } else {
+        testMode = false;
+        pmsStopRequested = false;
         g.active = true;
         startLevel(3, true);
       }
@@ -1416,47 +1644,51 @@ static void handleSerialServer(){
     }
     if (arg1.equalsIgnoreCase("L4")){
       if (g.active){
-        Serial.println("Game already active. Use GAME STOP first.");
+        DBG_PRINTLN("Game already active. Use GAME STOP first.");
       } else {
+        testMode = false;
+        pmsStopRequested = false;
         g.active = true;
         startLevel(4, true);
       }
       return;
     }
     if (arg1.equalsIgnoreCase("STOP")){
-      if (!g.active) Serial.println("No active game.");
+      if (!g.active) DBG_PRINTLN("No active game.");
       else {
+        pmsStopRequested = true;
         g.active = false;
         clearTargets();
         pushLedStates();
-        Serial.println("[GAME] stopped by CLI.");
+        DBG_PRINTLN("[GAME] stopped by CLI.");
       }
       return;
     }
-    Serial.println("Usage: GAME START|L1|L2|L3|L4|STOP");
+    DBG_PRINTLN("Usage: GAME START|L1|L2|L3|L4|STOP");
     return;
   }
   if (cmd=="TEST"){
     if (!arg1.length()){
-      Serial.println("Usage: TEST ON|OFF|CLEAR|TOP <id>|SIDE <id>");
+      DBG_PRINTLN("Usage: TEST ON|OFF|CLEAR|TOP <id>|SIDE <id>");
       return;
     }
     // Force a specific sensor to light (no physical trigger needed)
     if (arg1.equalsIgnoreCase("TOP") || arg1.equalsIgnoreCase("SIDE")){
       if (!rest.length()){
-        Serial.println("Usage: TEST TOP <id>   or   TEST SIDE <id>");
+        DBG_PRINTLN("Usage: TEST TOP <id>   or   TEST SIDE <id>");
         return;
       }
       int id = rest.toInt();
       if (arg1.equalsIgnoreCase("TOP")){
-        if (id < 1 || id > TOP_SENSOR_COUNT){ Serial.println("TOP id out of range"); return; }
+        if (id < 1 || id > TOP_SENSOR_COUNT){ DBG_PRINTLN("TOP id out of range"); return; }
       } else {
-        if (id < 1 || id > SIDE_SENSOR_COUNT){ Serial.println("SIDE id out of range"); return; }
+        if (id < 1 || id > SIDE_SENSOR_COUNT){ DBG_PRINTLN("SIDE id out of range"); return; }
       }
 
       if (g.active){
+        pmsStopRequested = true;
         g.active = false;
-        Serial.println("[TEST] Stopping active game.");
+        DBG_PRINTLN("[TEST] Stopping active game.");
       }
 
       testMode = true;
@@ -1471,15 +1703,16 @@ static void handleSerialServer(){
       else setSideBit((uint8_t)id);
 
       nextLedPushAt = millis();
-      Serial.printf("[TEST] Forced %s sensor=%d\n", arg1.c_str(), id);
+      DBG_PRINTF("[TEST] Forced %s sensor=%d\n", arg1.c_str(), id);
       return;
     }
 
     if (arg1.equalsIgnoreCase("ON")){
       // Stop any active game so we don't mix targets / rules.
       if (g.active){
+        pmsStopRequested = true;
         g.active = false;
-        Serial.println("[TEST] Stopping active game.");
+        DBG_PRINTLN("[TEST] Stopping active game.");
       }
 
       testMode = true;
@@ -1491,7 +1724,7 @@ static void handleSerialServer(){
       sendRoundInfo(false);
 
       nextLedPushAt = millis();
-      Serial.println("[TEST] ON. Trigger a sensor; the corresponding LED segment should light GREEN.");
+      DBG_PRINTLN("[TEST] ON. Trigger a sensor; the corresponding LED segment should light GREEN.");
       return;
     }
     if (arg1.equalsIgnoreCase("OFF")){
@@ -1499,16 +1732,16 @@ static void handleSerialServer(){
       hitFlashActive = false;
       clearTargets();
       nextLedPushAt = millis();
-      Serial.println("[TEST] OFF.");
+      DBG_PRINTLN("[TEST] OFF.");
       return;
     }
     if (arg1.equalsIgnoreCase("CLEAR")){
       clearTargets();
       nextLedPushAt = millis();
-      Serial.println("[TEST] Cleared targets.");
+      DBG_PRINTLN("[TEST] Cleared targets.");
       return;
     }
-    Serial.println("Usage: TEST ON|OFF|CLEAR|TOP <id>|SIDE <id>");
+    DBG_PRINTLN("Usage: TEST ON|OFF|CLEAR|TOP <id>|SIDE <id>");
     return;
   }
   if (cmd=="CFG"){
@@ -1517,50 +1750,157 @@ static void handleSerialServer(){
   }
   if (cmd=="SET"){
     if (!arg1.length() || !rest.length()){
-      Serial.println("Usage: SET <R1DUR|R2DUR|R3DUR|R4DUR|L1TOP|L1SIDE|REARM|GRACE|TOPGRACE|SIDEGRACE> <value>");
+      DBG_PRINTLN("Usage: SET <R1DUR|R2DUR|R3DUR|R4DUR|L1TOP|L1SIDE|REARM|GRACE|TOPGRACE|SIDEGRACE> <value>");
       return;
     }
     long v = rest.toInt();
     if (arg1.equalsIgnoreCase("R1DUR")){
-      if (v <= 0){ Serial.println("R1DUR must be >0"); return; }
+      if (v <= 0){ DBG_PRINTLN("R1DUR must be >0"); return; }
       cfg.r1DurationMs = (uint32_t)v;
     } else if (arg1.equalsIgnoreCase("R2DUR")){
-      if (v <= 0){ Serial.println("R2DUR must be >0"); return; }
+      if (v <= 0){ DBG_PRINTLN("R2DUR must be >0"); return; }
       cfg.r2DurationMs = (uint32_t)v;
     } else if (arg1.equalsIgnoreCase("R3DUR")){
-      if (v <= 0){ Serial.println("R3DUR must be >0"); return; }
+      if (v <= 0){ DBG_PRINTLN("R3DUR must be >0"); return; }
       cfg.r3DurationMs = (uint32_t)v;
     } else if (arg1.equalsIgnoreCase("R4DUR")){
-      if (v <= 0){ Serial.println("R4DUR must be >0"); return; }
+      if (v <= 0){ DBG_PRINTLN("R4DUR must be >0"); return; }
       cfg.r4DurationMs = (uint32_t)v;
     } else if (arg1.equalsIgnoreCase("L1TOP")){
-      if (v < 1 || v > 8){ Serial.println("L1TOP must be 1..8"); return; }
+      if (v < 1 || v > 8){ DBG_PRINTLN("L1TOP must be 1..8"); return; }
       cfg.topBlocks = (uint8_t)v;
     } else if (arg1.equalsIgnoreCase("L1SIDE")){
-      if (v < 1 || v > 8){ Serial.println("L1SIDE must be 1..8"); return; }
+      if (v < 1 || v > 8){ DBG_PRINTLN("L1SIDE must be 1..8"); return; }
       cfg.sideBlocks = (uint8_t)v;
     } else if (arg1.equalsIgnoreCase("REARM")){
-      if (v < 0){ Serial.println("REARM must be >=0"); return; }
+      if (v < 0){ DBG_PRINTLN("REARM must be >=0"); return; }
       cfg.scoreRearmMs = (uint32_t)v;
     } else if (arg1.equalsIgnoreCase("GRACE")){
-      if (v < 0){ Serial.println("GRACE must be >=0"); return; }
+      if (v < 0){ DBG_PRINTLN("GRACE must be >=0"); return; }
       cfg.roundChangeGraceMs = (uint32_t)v;
     } else if (arg1.equalsIgnoreCase("TOPGRACE")){
-      if (v < 0 || v > 6){ Serial.println("TOPGRACE must be 0..6"); return; }
+      if (v < 0 || v > 6){ DBG_PRINTLN("TOPGRACE must be 0..6"); return; }
       graceTopSensors = (uint8_t)v;
     } else if (arg1.equalsIgnoreCase("SIDEGRACE")){
-      if (v < 0 || v > 6){ Serial.println("SIDEGRACE must be 0..6"); return; }
+      if (v < 0 || v > 6){ DBG_PRINTLN("SIDEGRACE must be 0..6"); return; }
       graceSideSensors = (uint8_t)v;
     } else {
-      Serial.println("Unknown key. Use R1DUR, R2DUR, R3DUR, R4DUR, L1TOP, L1SIDE, REARM, GRACE, TOPGRACE, SIDEGRACE");
+      DBG_PRINTLN("Unknown key. Use R1DUR, R2DUR, R3DUR, R4DUR, L1TOP, L1SIDE, REARM, GRACE, TOPGRACE, SIDEGRACE");
       return;
     }
-    Serial.printf("SET %s = %ld\n", arg1.c_str(), v);
+    DBG_PRINTF("SET %s = %ld\n", arg1.c_str(), v);
     return;
   }
 
-  Serial.println("Unknown command. Type HELP.");
+  DBG_PRINTLN("Unknown command. Type HELP.");
 }
+
+
+#if PMS_STD_ENABLED
+
+static uint32_t pmsLastTickMs = 0;
+static bool     pmsPrevValid  = false;
+static bool     pmsPrevActive = false;
+static uint32_t pmsPrevScore  = 0;
+static uint8_t  pmsPrevLives  = 0;
+static uint8_t  pmsPrevLevel  = 1;
+static uint8_t  pmsPrevRoundIndex = 0;
+static RoundKind pmsPrevRoundKind = RK_NONE;
+
+static const char* pmsLastReasonStr(bool stateChanged, int64_t scoreDelta, int32_t livesDelta){
+  if (livesDelta < 0) return "life";
+  if (scoreDelta > 0) return "score";
+  if (stateChanged)   return "state";
+  return "none";
+}
+
+// Prints STATUS every PMS_STATUS_PERIOD_MS while arming/playing (silent while idle),
+// and emits EVENT lines based on state/score/life changes.
+static void pmsTick(){
+  uint32_t now = millis();
+  if ((uint32_t)(now - pmsLastTickMs) < (uint32_t)PMS_STATUS_PERIOD_MS) return;
+  pmsLastTickMs = now;
+
+  bool     active = g.active;
+  uint8_t  level  = g.levelIndex ? g.levelIndex : 1;
+  uint32_t score  = g.score;
+  uint8_t  lives  = g.lives;
+
+  uint32_t tleftMs = 0;
+  if (active && g.roundDurationMs > 0){
+    uint32_t elapsed = (uint32_t)(now - g.roundStartMs);
+    tleftMs = (elapsed >= g.roundDurationMs) ? 0 : (g.roundDurationMs - elapsed);
+  }
+
+  if (!pmsPrevValid){
+    pmsPrevValid = true;
+    pmsPrevActive = active;
+    pmsPrevScore = score;
+    pmsPrevLives = lives;
+    pmsPrevLevel = level;
+    pmsPrevRoundIndex = g.roundIndex;
+    pmsPrevRoundKind  = g.roundKind;
+
+    // No EVENT spam on boot. Only emit STATUS if a game is already active.
+    if (active){
+      pmsPrintStatus(pmsStateStr(), level, score, lives, tleftMs, "state");
+    }
+    return;
+  }
+
+  bool stateChanged = (active != pmsPrevActive);
+
+  // Treat level/round changes as a "state" change for last_reason (helps UI sync).
+  if (active && pmsPrevActive){
+    if (level != pmsPrevLevel ||
+        g.roundIndex != pmsPrevRoundIndex ||
+        g.roundKind  != pmsPrevRoundKind){
+      stateChanged = true;
+    }
+  }
+
+  int64_t scoreDelta = (int64_t)score - (int64_t)pmsPrevScore;
+  int32_t livesDelta = (int32_t)lives - (int32_t)pmsPrevLives;
+
+  // --- Events ---
+  if (!pmsPrevActive && active){
+    pmsPrintEventGameStart(level);
+  } else if (pmsPrevActive && !active){
+    const char* reason = "timeup";
+    if (lives == 0) reason = "no_lives";
+    else if (pmsStopRequested) reason = "stopped";
+    pmsPrintEventGameEnd(reason, score, lives);
+
+    // Consume stop flag once reported
+    pmsStopRequested = false;
+  }
+
+  if (active && pmsPrevActive){
+    if (scoreDelta > 0){
+      bool bonus = (g.roundKind == RK_BONUS_MOVING);
+      pmsPrintEventScore((int32_t)scoreDelta, score, bonus);
+    }
+    if (livesDelta < 0){
+      pmsPrintEventLife(livesDelta, lives);
+    }
+  }
+
+  // --- Status (silent while idle) ---
+  if (active){
+    const char* lastReason = pmsLastReasonStr(stateChanged, scoreDelta, livesDelta);
+    pmsPrintStatus(pmsStateStr(), level, score, lives, tleftMs, lastReason);
+  }
+
+  // Update baseline
+  pmsPrevActive = active;
+  pmsPrevScore = score;
+  pmsPrevLives = lives;
+  pmsPrevLevel = level;
+  pmsPrevRoundIndex = g.roundIndex;
+  pmsPrevRoundKind  = g.roundKind;
+}
+
+#endif // PMS_STD_ENABLED
 
 // ========== setup / loop ==========
 void setup(){
@@ -1568,7 +1908,7 @@ void setup(){
   nvsSaveName(myName);
 
   wifiStaOnCh6();
-  if (!nowInit()) Serial.println("ESP-NOW init failed!");
+  if (!nowInit()) DBG_PRINTLN("ESP-NOW init failed!");
   esp_now_register_recv_cb(onNowRecv);
 
   HelloMsg hm{}; hm.h.kind=MSG_HELLO; strncpy(hm.h.target,"ALL",sizeof(hm.h.target)-1);
@@ -1578,11 +1918,16 @@ void setup(){
   esp_now_send(BCAST,(uint8_t*)&hm,sizeof(hm));
   randomSeed(esp_random());
 
-  Serial.println("Server ready. Type HELP for commands.");
+  DBG_PRINTLN("Server ready. Type HELP for commands.");
 }
 
 void loop(){
   handleSerialServer();
+
+#if PMS_STD_ENABLED
+  pmsTick();
+#endif
+
 
   uint32_t now = millis();
 
@@ -1593,9 +1938,9 @@ void loop(){
     }
   }
   if (listPrintAt && (int32_t)(now - listPrintAt) >= 0){
-    listPrintAt=0; Serial.println("Last seen clients:");
+    listPrintAt=0; DBG_PRINTLN("Last seen clients:");
     for (int i=0;i<32;i++) if (seen[i].name.length())
-      Serial.printf(" - %s  boot=%lu  build=%s  (%lus ago)\n",
+      DBG_PRINTF(" - %s  boot=%lu  build=%s  (%lus ago)\n",
         seen[i].name.c_str(),
         (unsigned long)seen[i].bootCount,
         (seen[i].build[0] ? seen[i].build : "-"),
@@ -1613,7 +1958,7 @@ void loop(){
   if (g.active && g.roundDurationMs > 0){
     if ((uint32_t)(now - g.roundStartMs) >= g.roundDurationMs){
       if (g.roundKind == RK_WARMUP){
-        Serial.printf("[L%uR%u] TIMEOUT (Warmup) -> next round, score=%lu lives=%u\n",
+        DBG_PRINTF("[L%uR%u] TIMEOUT (Warmup) -> next round, score=%lu lives=%u\n",
           (unsigned)g.levelIndex,
           (unsigned)(g.roundIndex+1),
           (unsigned long)g.score,
@@ -1621,7 +1966,7 @@ void loop(){
         uint8_t nextRound = g.roundIndex + 1;
         startRound(nextRound);
       } else if (g.roundKind == RK_BONUS_MOVING){
-        Serial.printf("[L%uR%u] TIMEOUT (BONUS) -> finish level, score=%lu lives=%u\n",
+        DBG_PRINTF("[L%uR%u] TIMEOUT (BONUS) -> finish level, score=%lu lives=%u\n",
           (unsigned)g.levelIndex,
           (unsigned)(g.roundIndex+1),
           (unsigned long)g.score,
