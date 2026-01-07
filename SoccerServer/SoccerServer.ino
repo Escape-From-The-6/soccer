@@ -70,6 +70,8 @@
 
 static String myName = "Soccer-server";
 
+static uint8_t radioChannel = SOCCER_DEFAULT_ESPNOW_CHANNEL;
+
 // ========== Roster ==========
 
 struct Seen {
@@ -142,6 +144,59 @@ static bool rememberHello(const char* n, uint32_t bootCount=0, const char* build
 static const char* NAME_TOPLEFT  = "Soccer-topleft";
 static const char* NAME_TOPRIGHT = "Soccer-topright";
 static const char* NAME_SIDE     = "Soccer-side";
+
+// ========== Peer MACs (auto-learned) ==========
+// We learn the MACs of the Soccer clients at runtime (HELLO and/or sensor events).
+// This lets us unicast frequent messages (LED targets) instead of broadcasting.
+static uint8_t macTopLeft[6]  = {0,0,0,0,0,0};
+static uint8_t macTopRight[6] = {0,0,0,0,0,0};
+static uint8_t macSide[6]     = {0,0,0,0,0,0};
+static bool macTopLeftKnown=false, macTopRightKnown=false, macSideKnown=false;
+
+static inline bool macEqual(const uint8_t a[6], const uint8_t b[6]){
+  return memcmp(a,b,6)==0;
+}
+
+static inline void macToStr(const uint8_t mac[6], char* out, size_t outLen){
+  snprintf(out, outLen, "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+}
+
+static void notePeerMac(const char* name, const uint8_t srcMac[6]){
+  if(!name || !*name || !srcMac) return;
+  if (memcmp(srcMac, BCAST, 6) == 0) return;
+
+  if (!strcasecmp(name, NAME_TOPLEFT)){
+    if (!macTopLeftKnown || !macEqual(macTopLeft, srcMac)){
+      memcpy(macTopLeft, srcMac, 6);
+      macTopLeftKnown = true;
+      nowEnsurePeer(macTopLeft, radioChannel);
+      char buf[24]; macToStr(macTopLeft, buf, sizeof(buf));
+      DBG_PRINTF("[PEER] %s = %s\n", NAME_TOPLEFT, buf);
+    }
+    return;
+  }
+  if (!strcasecmp(name, NAME_TOPRIGHT)){
+    if (!macTopRightKnown || !macEqual(macTopRight, srcMac)){
+      memcpy(macTopRight, srcMac, 6);
+      macTopRightKnown = true;
+      nowEnsurePeer(macTopRight, radioChannel);
+      char buf[24]; macToStr(macTopRight, buf, sizeof(buf));
+      DBG_PRINTF("[PEER] %s = %s\n", NAME_TOPRIGHT, buf);
+    }
+    return;
+  }
+  if (!strcasecmp(name, NAME_SIDE)){
+    if (!macSideKnown || !macEqual(macSide, srcMac)){
+      memcpy(macSide, srcMac, 6);
+      macSideKnown = true;
+      nowEnsurePeer(macSide, radioChannel);
+      char buf[24]; macToStr(macSide, buf, sizeof(buf));
+      DBG_PRINTF("[PEER] %s = %s\n", NAME_SIDE, buf);
+    }
+    return;
+  }
+}
 
 // ========== Game / Config ==========
 
@@ -305,7 +360,7 @@ static uint8_t targetSideBits[2] = {0,0};
 
 // LED cadence
 static uint32_t nextLedPushAt=0;
-static const uint32_t LED_PUSH_MIN_MS=40;
+static const uint32_t LED_PUSH_MIN_MS=40;  // ms (restores pre-v2 visual timing; avoids accidental ultra-spam)
 
 // ========== Target helpers ==========
 static inline void clearTargets(){
@@ -438,17 +493,17 @@ static void pushLedStates(){
 
   { // TOP targets
     LedTopMsg t{};
-    t.h.kind = MSG_LED_TOP;
-    strncpy(t.h.target, NAME_TOPRIGHT, sizeof(t.h.target)-1);
+    headerInit(t.h, MSG_LED_TOP, NAME_TOPRIGHT);
     memcpy(t.bits, sendTop, sizeof(sendTop));
-    esp_now_send(BCAST, (uint8_t*)&t, sizeof(t));
+    const uint8_t* dest = macTopRightKnown ? macTopRight : BCAST;
+    esp_now_send(dest, (uint8_t*)&t, sizeof(t));
   }
   { // SIDE targets
     LedSideMsg s{};
-    s.h.kind = MSG_LED_SIDE;
-    strncpy(s.h.target, NAME_SIDE, sizeof(s.h.target)-1);
+    headerInit(s.h, MSG_LED_SIDE, NAME_SIDE);
     memcpy(s.bits, sendSide, sizeof(sendSide));
-    esp_now_send(BCAST, (uint8_t*)&s, sizeof(s));
+    const uint8_t* dest = macSideKnown ? macSide : BCAST;
+    esp_now_send(dest, (uint8_t*)&s, sizeof(s));
   }
 }
 
@@ -542,37 +597,40 @@ static const uint32_t HELLO_DRIP_INTERVAL_MS=200, HELLO_SETTLE_MS=350;
 
 // ========== Sends ==========
 static void sendHelloReqAll(){
-  MsgHeader h{}; h.kind=MSG_HELLO_REQ; strncpy(h.target,"ALL",sizeof(h.target)-1);
+  MsgHeader h{};
+  headerInit(h, MSG_HELLO_REQ, "ALL");
   esp_now_send(BCAST,(uint8_t*)&h,sizeof(h));
 }
 
 static void sendWifiSet(const char* target,const String& ssid,const String& pass){
-  WifiSetMsg m{}; m.h.kind=MSG_WIFI_SET;
-  strncpy(m.h.target,target,sizeof(m.h.target)-1);
+  WifiSetMsg m{};
+  headerInit(m.h, MSG_WIFI_SET, target);
   strncpy(m.ssid,ssid.c_str(),sizeof(m.ssid)-1);
   strncpy(m.pass,pass.c_str(),sizeof(m.pass)-1);
+
+  // WiFi/OTA config is infrequent; broadcast is fine (target filtering happens on clients).
   esp_now_send(BCAST,(uint8_t*)&m,sizeof(m));
 }
 
 static void sendOta(const char* target,const String& url){
-  OtaMsg m{}; m.h.kind=MSG_OTA_TRIGGER;
+  OtaMsg m{};
   const char* tgt=(target&&*target)?target:"ALL";
-  strncpy(m.h.target,tgt,sizeof(m.h.target)-1);
+  headerInit(m.h, MSG_OTA_TRIGGER, tgt);
   strncpy(m.url,url.c_str(),sizeof(m.url)-1);
   esp_now_send(BCAST,(uint8_t*)&m,sizeof(m));
 }
 
 static void sendNameSet(const char* target,const String& newName){
-  NameSetMsg m{}; m.h.kind=MSG_NAME_SET;
-  strncpy(m.h.target,target,sizeof(m.h.target)-1);
+  NameSetMsg m{};
+  headerInit(m.h, MSG_NAME_SET, target);
   strncpy(m.name,newName.c_str(),sizeof(m.name)-1);
   esp_now_send(BCAST,(uint8_t*)&m,sizeof(m));
 }
 
 static void sendPinSet(const char* target, uint8_t sensorId, uint8_t gpio){
-  PinSetMsg m{}; m.h.kind=MSG_PIN_SET;
+  PinSetMsg m{};
   const char* tgt=(target&&*target)?target:"ALL";
-  strncpy(m.h.target,tgt,sizeof(m.h.target)-1);
+  headerInit(m.h, MSG_PIN_SET, tgt);
   m.sensor_id = sensorId;
   m.gpio      = gpio;
   esp_now_send(BCAST,(uint8_t*)&m,sizeof(m));
@@ -580,27 +638,57 @@ static void sendPinSet(const char* target, uint8_t sensorId, uint8_t gpio){
 
 static void sendLifeFlash(uint16_t durationMs){
   LifeFlashMsg m{};
-  m.h.kind = MSG_LIFE_FLASH;
-  strncpy(m.h.target,"ALL",sizeof(m.h.target)-1);
+  headerInit(m.h, MSG_LIFE_FLASH, "ALL");
   m.durationMs = durationMs;
   esp_now_send(BCAST,(uint8_t*)&m,sizeof(m));
 }
 
 static void sendMode(bool penalty){
   ModeMsg m{};
-  m.h.kind = MSG_MODE;
-  strncpy(m.h.target,"ALL",sizeof(m.h.target)-1);
+  headerInit(m.h, MSG_MODE, "ALL");
   m.penaltyMode = penalty ? 1 : 0;
   esp_now_send(BCAST,(uint8_t*)&m,sizeof(m));
 }
 
 static void sendRoundInfo(bool bonusRound){
+  // Round info is what drives BONUS rainbow on clients.
+  // In v2 we unicast most high-rate traffic; this message was still broadcast-only.
+  // If a single broadcast is missed, clients will stay in "normal" coloring for the whole bonus round.
+  //
+  // So we:
+  //  1) Unicast to known peers (ACKed) for reliability.
+  //  2) Also broadcast as a fallback for brand-new/replaced boards that haven't been learned yet.
+
   RoundInfoMsg m{};
-  m.h.kind = MSG_ROUND_INFO;
-  strncpy(m.h.target,"ALL",sizeof(m.h.target)-1);
   m.bonusRound = bonusRound ? 1 : 0;
+
+  // Unicast (reliable) to known clients
+  if (macTopRightKnown){
+    headerInit(m.h, MSG_ROUND_INFO, NAME_TOPRIGHT);
+    esp_now_send(macTopRight, (uint8_t*)&m, sizeof(m));
+  }
+  if (macSideKnown){
+    headerInit(m.h, MSG_ROUND_INFO, NAME_SIDE);
+    esp_now_send(macSide, (uint8_t*)&m, sizeof(m));
+  }
+  if (macTopLeftKnown){
+    headerInit(m.h, MSG_ROUND_INFO, NAME_TOPLEFT);
+    esp_now_send(macTopLeft, (uint8_t*)&m, sizeof(m));
+  }
+
+  // Broadcast fallback
+  headerInit(m.h, MSG_ROUND_INFO, "ALL");
+  esp_now_send(BCAST, (uint8_t*)&m, sizeof(m));
+}
+
+static void sendChanSetAll(uint8_t channel){
+  ChannelSetMsg m{};
+  headerInit(m.h, MSG_CHAN_SET, "ALL");
+  m.channel = channel;
+  m.reserved = 0;
   esp_now_send(BCAST,(uint8_t*)&m,sizeof(m));
 }
+
 
 // Forward declarations
 static void startRound(uint8_t roundIdx);
@@ -822,7 +910,7 @@ static void startRound(uint8_t roundIdx){
 
     g.activeBlock = (uint8_t)random(0, g.blockCount);
     rebuildTargetsFromBlocks();
-    nextLedPushAt = now + LED_PUSH_MIN_MS;
+    nextLedPushAt = now;
 
     DBG_PRINTF("[L%uR1] start Warmup arena=%s block %u/%u ids=%u..%u dur=%lus\n",
       (unsigned)g.levelIndex,
@@ -851,7 +939,7 @@ static void startRound(uint8_t roundIdx){
     initBlocksForArena(blockCount, TOTAL_TOP_SENSORS, TOTAL_SIDE_SENSORS, true);
 
     rebuildTargetsFromBlocks();
-    nextLedPushAt = now + LED_PUSH_MIN_MS;
+    nextLedPushAt = now;
 
     DBG_PRINTF("[L%uR%u] start HitAll A arena=%s blocks=%u dur=%lus\n",
       (unsigned)g.levelIndex,
@@ -879,7 +967,7 @@ static void startRound(uint8_t roundIdx){
     initBlocksForArena(blockCount, TOTAL_TOP_SENSORS, TOTAL_SIDE_SENSORS, true);
 
     rebuildTargetsFromBlocks();
-    nextLedPushAt = now + LED_PUSH_MIN_MS;
+    nextLedPushAt = now;
 
     DBG_PRINTF("[L%uR%u] start HitAll B arena=%s blocks=%u dur=%lus\n",
       (unsigned)g.levelIndex,
@@ -903,7 +991,7 @@ static void startRound(uint8_t roundIdx){
     shrink.center = random(1, maxSensors+1);
 
     updateShrinkingTargets();
-    nextLedPushAt = now + LED_PUSH_MIN_MS;
+    nextLedPushAt = now;
 
     DBG_PRINTF("[L%uR%u] start Shrinking arena=%s center=%u dur=%lus (widths=%u,%u,%u)\n",
       (unsigned)g.levelIndex,
@@ -942,7 +1030,7 @@ static void startRound(uint8_t roundIdx){
     } else if (g.arena == ARENA_SIDE){
       for (uint8_t id=bonus.minId; id<=bonus.maxId; ++id) setSideBit(id);
     }
-    nextLedPushAt = now + LED_PUSH_MIN_MS;
+    nextLedPushAt = now;
 
     DBG_PRINTF("[L%uR%u] start BONUS sliding arena=%s center=%u width=%u dur=%lus\n",
       (unsigned)g.levelIndex,
@@ -1270,6 +1358,7 @@ static void handleSensorEvent(const SensorEventMsg* m){
 static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len){
   if (len < (int)sizeof(MsgHeader)) return;
   const MsgHeader* h=(const MsgHeader*)data;
+  if (!headerValid(h)) return;
 
   
 // HELLO (clients announce themselves at boot; includes optional build/bootCount)
@@ -1288,6 +1377,7 @@ if (h->kind == MSG_HELLO && len >= HELLO_V1_SIZE){
     if (!build[0]) build = "unknown";
   }
 
+  notePeerMac(m->name, info->src_addr);
   bool shouldPrint = rememberHello(m->name, boot, build);
   if (shouldPrint){
     DBG_PRINTF("[HELLO] %s  boot=%lu  build=%s\n",
@@ -1304,6 +1394,7 @@ if (h->kind == MSG_HELLO && len >= HELLO_V1_SIZE){
 
   if (h->kind == MSG_SENSOR_EVENT && len >= (int)sizeof(SensorEventMsg)){
     const SensorEventMsg* m=(const SensorEventMsg*)data;
+    notePeerMac(m->name, info->src_addr);
     handleSensorEvent(m);
     DBG_PRINTF("[EVT] %s s%u gpio%u state=%u seq=%u\n",
       m->name, m->sensor_id, m->gpio, m->state, m->seq);
@@ -1340,6 +1431,7 @@ static void printHelp(){
   DBG_PRINTLN("NAME <ALL|currentName> <newName>");
   DBG_PRINTLN("PIN <name> <sensorId> <gpio>  (configure client sensor GPIO; ex: PIN Soccer-topleft 14 19)");
   DBG_PRINTLN("LIST");
+  DBG_PRINTLN("CHAN <1-13>   (set ESPNOW channel for ALL Soccer nodes, save+reboot)");
   DBG_PRINTLN("GAME START   (Level 1)");
   DBG_PRINTLN("GAME L1      (Level 1)");
   DBG_PRINTLN("GAME L2      (Level 2)");
@@ -1555,6 +1647,20 @@ static void handleSerialServer(){
     DBG_PRINTLN("Requesting HELLOs (drip)...");
     return;
   }
+  if (cmd=="CHAN" || cmd=="CHANNEL"){
+    if(!arg1.length()){ DBG_PRINTLN("Usage: CHAN <1-13>"); return; }
+    int ch = arg1.toInt();
+    if (ch < 1 || ch > 13){ DBG_PRINTLN("Channel must be 1..13"); return; }
+
+    DBG_PRINTF("[RADIO] Sending CHAN_SET=%d to ALL clients, then rebooting server...\n", ch);
+    sendChanSetAll((uint8_t)ch);
+
+    delay(250); // give packets time to go out
+    nvsSaveChannel((uint8_t)ch);
+    delay(100);
+    ESP.restart();
+  }
+
   if (cmd=="WIFI"){
     if(!arg1.length()){DBG_PRINTLN("Usage: WIFI <ALL|name> <ssid> <pass>");return;}
     int sp=rest.indexOf(' ');
@@ -1907,16 +2013,24 @@ void setup(){
   Serial.begin(115200); delay(200);
   nvsSaveName(myName);
 
-  wifiStaOnCh6();
-  if (!nowInit()) DBG_PRINTLN("ESP-NOW init failed!");
+  radioChannel = nvsLoadChannel(SOCCER_DEFAULT_ESPNOW_CHANNEL);
+  wifiStaOnChannel(radioChannel);
+  if (!nowInit(radioChannel)) DBG_PRINTLN("ESP-NOW init failed!");
   esp_now_register_recv_cb(onNowRecv);
 
-  HelloMsg hm{}; hm.h.kind=MSG_HELLO; strncpy(hm.h.target,"ALL",sizeof(hm.h.target)-1);
+  DBG_PRINTF("[RADIO] ESPNOW channel=%u  MAC=%s\n", (unsigned)radioChannel, WiFi.macAddress().c_str());
+
+  HelloMsg hm{};
+  headerInit(hm.h, MSG_HELLO, "ALL");
   strncpy(hm.name,myName.c_str(),sizeof(hm.name)-1);
   hm.bootCount = 0;
   snprintf(hm.build, sizeof(hm.build), "%s %s", __DATE__, __TIME__);
   esp_now_send(BCAST,(uint8_t*)&hm,sizeof(hm));
   randomSeed(esp_random());
+
+  // Auto-request HELLOs at boot (no manual LIST required; helps with any boot order)
+  helloDripActive=true; helloDripRemain=HELLO_DRIP_COUNT;
+  helloNextAt=millis(); listPrintAt=0;
 
   DBG_PRINTLN("Server ready. Type HELP for commands.");
 }
@@ -1978,7 +2092,7 @@ void loop(){
     }
   }
 
-  if ((int32_t)(now - nextLedPushAt) >= 0){
+  if ((g.active || testMode) && (int32_t)(now - nextLedPushAt) >= 0){
     pushLedStates();
     nextLedPushAt = now + LED_PUSH_MIN_MS;
   }

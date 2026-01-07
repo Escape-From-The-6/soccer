@@ -34,8 +34,52 @@ static bool bonusRoundActive = false;
 static uint8_t rainbowPhase = 0;
 
 // ================= ESP-NOW control =================
+static uint8_t radioChannel = SOCCER_DEFAULT_ESPNOW_CHANNEL;
+
 static bool espNowStarted=false;
-static void startEspNow(){ if(!espNowStarted){ wifiStaOnCh6(); if(nowInit()){ esp_now_register_recv_cb(nullptr); espNowStarted=true; }}}
+
+// Remember the last *server* MAC we heard from, so sensor events can be unicast
+// (reduces unnecessary broadcast traffic on shared channels).
+static uint8_t  serverMac[6]      = {0,0,0,0,0,0};
+static bool     serverMacKnown    = false;
+static uint32_t serverLastSeenMs  = 0;
+
+static inline bool kindLikelyFromServer(uint8_t kind){
+  switch(kind){
+    case MSG_HELLO_REQ:
+    case MSG_WIFI_SET:
+    case MSG_OTA_TRIGGER:
+    case MSG_NAME_SET:
+    case MSG_PIN_SET:
+    case MSG_LED_TOP:
+    case MSG_LED_SIDE:
+    case MSG_LIFE_FLASH:
+    case MSG_MODE:
+    case MSG_ROUND_INFO:
+    case MSG_CHAN_SET:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static inline void rememberServerMac(const esp_now_recv_info* info){
+  if (!info) return;
+  if (memcmp(info->src_addr, BCAST, 6) == 0) return; // should never happen, but be safe
+  memcpy(serverMac, info->src_addr, 6);
+  serverMacKnown   = true;
+  serverLastSeenMs = millis();
+  nowEnsurePeer(serverMac, radioChannel);
+}
+
+static void startEspNow(){
+  if(espNowStarted) return;
+  radioChannel = nvsLoadChannel(SOCCER_DEFAULT_ESPNOW_CHANNEL);
+  wifiStaOnChannel(radioChannel);
+  if(nowInit(radioChannel)){
+    espNowStarted=true;
+  }
+}
 static void stopEspNow(){ if(espNowStarted){ esp_now_deinit(); espNowStarted=false; }}
 
 
@@ -74,8 +118,8 @@ static uint32_t nvsNextBootCount(){
 
 static inline void sendHello(){
   if(!espNowStarted) return;
-  HelloMsg hm{}; hm.h.kind=MSG_HELLO;
-  strncpy(hm.h.target,"ALL",sizeof(hm.h.target)-1);
+  HelloMsg hm{};
+  headerInit(hm.h, MSG_HELLO, "ALL");
   strncpy(hm.name,deviceName.c_str(),sizeof(hm.name)-1);
   hm.bootCount = bootCount;
   snprintf(hm.build, sizeof(hm.build), "%s %s", __DATE__, __TIME__);
@@ -122,10 +166,13 @@ static const uint32_t TRIG_COOLDOWN_MS = 120; // per-sensor cooldown on sending 
 static uint16_t seq = 1;
 
 static inline void sendTrigger(uint8_t id, uint8_t gpio){
-  SensorEventMsg m{}; m.h.kind=MSG_SENSOR_EVENT; strncpy(m.h.target,"ALL",sizeof(m.h.target)-1);
+  SensorEventMsg m{};
+  headerInit(m.h, MSG_SENSOR_EVENT, "ALL");
   strncpy(m.name,deviceName.c_str(),sizeof(m.name)-1);
   m.sensor_id=id; m.gpio=gpio; m.state=1; m.seq=seq++; m.ts_ms=millis();
-  esp_now_send(BCAST,(uint8_t*)&m,sizeof(m));
+
+  const uint8_t* dest = serverMacKnown ? serverMac : BCAST;
+  esp_now_send(dest,(uint8_t*)&m,sizeof(m));
 }
 
 // SIDE: sensors 1..13
@@ -202,7 +249,14 @@ static uint32_t wheelColor(uint8_t pos){
 
 // ================= RX (apply overlays; keep control queues) =================
 static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len){
-  if (len < (int)sizeof(MsgHeader)) return; const MsgHeader* h=(const MsgHeader*)data;
+  if (len < (int)sizeof(MsgHeader)) return;
+  const MsgHeader* h=(const MsgHeader*)data;
+  if (!headerValid(h)) return;
+
+  // Only trust MAC capture for messages that only the server should be sending.
+  if (kindLikelyFromServer(h->kind)){
+    rememberServerMac(info);
+  }
 
   if (h->kind == MSG_WIFI_SET && len >= (int)sizeof(WifiSetMsg)){
     const WifiSetMsg* m=(const WifiSetMsg*)data;
@@ -243,6 +297,17 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
       }
     }
     return;
+  }
+
+  // Set ESPNOW channel (save to NVS + reboot)
+  if (h->kind == MSG_CHAN_SET && len >= (int)sizeof(ChannelSetMsg)){
+    const ChannelSetMsg* m=(const ChannelSetMsg*)data;
+    if(!nameMatches(m->h.target,deviceName)) return;
+    uint8_t ch = m->channel;
+    if (ch < 1 || ch > 13) return;
+    nvsSaveChannel(ch);
+    delay(150);
+    ESP.restart();
   }
 
   if (h->kind == MSG_HELLO_REQ){
@@ -478,6 +543,8 @@ void setup(){
   helloDripRemain = (HELLO_DRIP_COUNT>0) ? (HELLO_DRIP_COUNT-1) : 0;
   helloNextAt = millis() + HELLO_DRIP_INTERVAL_MS;
 
+  Serial.printf("[RADIO] ESPNOW channel=%u  MAC=%s\n", (unsigned)radioChannel, WiFi.macAddress().c_str());
+
   Serial.printf("Boot %s  (role: %s)  LEDs=%u on IO%d\n",
     deviceName.c_str(),
     ROLE_TOPLEFT ? "TopLeft(no-LED)" : (ROLE_TOPRIGHT ? "TopRight" : (ROLE_SIDE ? "Side" : "Unknown")),
@@ -500,8 +567,8 @@ void loop(){
     if (connectForOta(&why)){
       WiFiClient client; HTTPUpdate up; up.rebootOnUpdate(true); up.update(client,url);
     }
-    wifiStaOnCh6();
     startEspNow();
+    esp_now_register_recv_cb(onNowRecv);
   }
 
   // Poll sensors (fast), like your test
