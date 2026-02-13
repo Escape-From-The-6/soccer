@@ -1,6 +1,8 @@
 #include "SoccerCommon.h"
 #include <esp_system.h>
 #include <stddef.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 // =============================================================
 // Soccer Shootout ESP-NOW Server
 //
@@ -32,8 +34,9 @@
 // Notes:
 // - `state=arming` is used during the Warmup round (RK_WARMUP). All other rounds use `state=playing`.
 // - `tleft_ms` is time remaining in the *current round* (Warmup/HitAll/Shrink/Bonus).
-// - `bonus=1` is emitted for score events during the BONUS round (RK_BONUS_MOVING), else 0.
-//   (Bonus round score increment is SOCCER_BONUS_SCORE_DELTA, default 2.)
+// - `bonus=1` is emitted for score events that come from a BONUS WINDOW hit.
+//   (Currently that only happens in RK_BONUS_MOVING, and the increment is
+//    SOCCER_BONUS_SCORE_DELTA, default 2.)
 // =============================================================
 
 #ifndef PMS_STD_ENABLED
@@ -699,6 +702,23 @@ static void onShrinkCleared();
 static void onBonusCleared();
 static void finishLevelAdvance();
 
+#if PMS_STD_ENABLED
+// Score events are queued from the ESPNOW receive callback (sensor hits) and
+// flushed from the main loop (pmsTick) to avoid Serial interleaving.
+static void pmsQueueScoreEvent(int32_t delta, uint32_t total, bool bonus);
+static void pmsClearScoreQueue();
+#endif
+
+// Centralized scoring helper so PMS can correctly tag bonus hits.
+static inline void addScore(uint32_t delta, bool isBonus){
+  g.score += delta;
+#if PMS_STD_ENABLED
+  if (g.active){
+    pmsQueueScoreEvent((int32_t)delta, g.score, isBonus);
+  }
+#endif
+}
+
 // ========== Life loss helpers ==========
 static void loseLifeAndRestart(const char* reason){
   if (!g.active) return;
@@ -1062,6 +1082,11 @@ static void startLevel(uint8_t levelIndex, bool resetScoreAndLives){
   if (resetScoreAndLives){
     g.score = 0;
     g.lives = 5;
+
+#if PMS_STD_ENABLED
+    // New game => discard any pending score events from a previous run.
+    pmsClearScoreQueue();
+#endif
   }
 
   sendMode(g.penaltyMode);
@@ -1150,7 +1175,7 @@ static void handleSensorEvent(const SensorEventMsg* m){
       return;
     }
 
-    g.score++;
+    addScore(1, false);
     shrinkHits++;
 
     // Global hit grace
@@ -1192,7 +1217,7 @@ static void handleSensorEvent(const SensorEventMsg* m){
       return;
     }
 
-    g.score += SOCCER_BONUS_SCORE_DELTA;
+    addScore(SOCCER_BONUS_SCORE_DELTA, true);
 
     // Global hit grace
     lastHitGlobalMs = now;
@@ -1234,7 +1259,7 @@ static void handleSensorEvent(const SensorEventMsg* m){
     }
 
     // Correct hit (inside block OR within grace)
-    g.score++;
+    addScore(1, false);
 
 
     // Global hit grace
@@ -1301,7 +1326,7 @@ static void handleSensorEvent(const SensorEventMsg* m){
 
     if (bestBlock >= 0){
       g.blockCleared[(uint8_t)bestBlock] = true;
-      g.score++;
+      addScore(1, false);
 
       // Global hit grace
       lastHitGlobalMs = now;
@@ -1523,6 +1548,78 @@ static void pmsPrintEventScore(int32_t delta, uint32_t total, bool bonus){
   PMS_PRINT(total);
   PMS_PRINT(" bonus=");
   PMS_PRINTLN(bonus ? 1 : 0);
+}
+
+// --- Score event queue (producer: ESPNOW receive callback; consumer: pmsTick) ---
+// This prevents Serial interleaving and guarantees that the `bonus=` flag reflects
+// *what was hit* (bonus window or not), instead of whatever round happens to be
+// active when the 250ms PMS tick runs.
+//
+// NOTE (Arduino .ino quirk):
+// Avoid custom types in function signatures here because the Arduino preprocessor
+// can auto-generate prototypes before the type is declared.
+static const uint8_t PMS_SCORE_Q_CAP = 16;
+
+// Ring buffer storage
+static int32_t  pmsScoreDeltaQ[PMS_SCORE_Q_CAP];
+static uint32_t pmsScoreTotalQ[PMS_SCORE_Q_CAP];
+static uint8_t  pmsScoreBonusQ[PMS_SCORE_Q_CAP]; // 0/1
+static uint8_t  pmsScoreHead = 0;
+static uint8_t  pmsScoreTail = 0;
+static portMUX_TYPE  pmsScoreMux  = portMUX_INITIALIZER_UNLOCKED;
+
+static void pmsClearScoreQueue(){
+  portENTER_CRITICAL(&pmsScoreMux);
+  pmsScoreHead = 0;
+  pmsScoreTail = 0;
+  portEXIT_CRITICAL(&pmsScoreMux);
+}
+
+static void pmsQueueScoreEvent(int32_t delta, uint32_t total, bool bonus){
+  portENTER_CRITICAL(&pmsScoreMux);
+
+  uint8_t next = (uint8_t)(pmsScoreHead + 1);
+  if (next >= PMS_SCORE_Q_CAP) next = 0;
+
+  // If the queue is full, drop the oldest event.
+  if (next == pmsScoreTail){
+    pmsScoreTail = (uint8_t)(pmsScoreTail + 1);
+    if (pmsScoreTail >= PMS_SCORE_Q_CAP) pmsScoreTail = 0;
+  }
+
+  pmsScoreDeltaQ[pmsScoreHead] = delta;
+  pmsScoreTotalQ[pmsScoreHead] = total;
+  pmsScoreBonusQ[pmsScoreHead] = bonus ? 1 : 0;
+  pmsScoreHead = next;
+
+  portEXIT_CRITICAL(&pmsScoreMux);
+}
+
+static bool pmsPopScoreEvent(int32_t &delta, uint32_t &total, bool &bonus){
+  portENTER_CRITICAL(&pmsScoreMux);
+  if (pmsScoreTail == pmsScoreHead){
+    portEXIT_CRITICAL(&pmsScoreMux);
+    return false;
+  }
+
+  delta = pmsScoreDeltaQ[pmsScoreTail];
+  total = pmsScoreTotalQ[pmsScoreTail];
+  bonus = (pmsScoreBonusQ[pmsScoreTail] != 0);
+
+  pmsScoreTail = (uint8_t)(pmsScoreTail + 1);
+  if (pmsScoreTail >= PMS_SCORE_Q_CAP) pmsScoreTail = 0;
+
+  portEXIT_CRITICAL(&pmsScoreMux);
+  return true;
+}
+
+static void pmsFlushScoreEvents(){
+  int32_t  delta;
+  uint32_t total;
+  bool     bonus;
+  while (pmsPopScoreEvent(delta, total, bonus)){
+    pmsPrintEventScore(delta, total, bonus);
+  }
 }
 
 static void pmsPrintEventLife(int32_t delta, uint8_t lives){
@@ -1940,17 +2037,23 @@ static void pmsTick(){
 
   if (!pmsPrevValid){
     pmsPrevValid = true;
+
+    // First PMS tick since boot/attach.
+    // If a game is already active, announce it and flush any early score events
+    // that may have occurred before the first tick.
+    if (active){
+      pmsPrintEventGameStart(level);
+      pmsFlushScoreEvents();
+      pmsPrintStatus(pmsStateStr(), level, score, lives, tleftMs, "state");
+    }
+
+    // Establish baseline
     pmsPrevActive = active;
     pmsPrevScore = score;
     pmsPrevLives = lives;
     pmsPrevLevel = level;
     pmsPrevRoundIndex = g.roundIndex;
     pmsPrevRoundKind  = g.roundKind;
-
-    // No EVENT spam on boot. Only emit STATUS if a game is already active.
-    if (active){
-      pmsPrintStatus(pmsStateStr(), level, score, lives, tleftMs, "state");
-    }
     return;
   }
 
@@ -1968,10 +2071,26 @@ static void pmsTick(){
   int64_t scoreDelta = (int64_t)score - (int64_t)pmsPrevScore;
   int32_t livesDelta = (int32_t)lives - (int32_t)pmsPrevLives;
 
+  bool started = (!pmsPrevActive && active);
+  bool ended   = (pmsPrevActive && !active);
+
   // --- Events ---
-  if (!pmsPrevActive && active){
+  if (started){
     pmsPrintEventGameStart(level);
-  } else if (pmsPrevActive && !active){
+  }
+
+  // Emit life events even if the last life-loss ended the game (active just turned off).
+  if (livesDelta < 0 && (active || pmsPrevActive)){
+    pmsPrintEventLife(livesDelta, lives);
+  }
+
+  // Flush queued score events. This guarantees:
+  //  - bonus=1 only when a BONUS hit was actually scored
+  //  - score events aren't lost if the game ends between ticks
+  //  - score never appears before game_start (because we print game_start first)
+  pmsFlushScoreEvents();
+
+  if (ended){
     const char* reason = "timeup";
     if (lives == 0) reason = "no_lives";
     else if (pmsStopRequested) reason = "stopped";
@@ -1979,16 +2098,6 @@ static void pmsTick(){
 
     // Consume stop flag once reported
     pmsStopRequested = false;
-  }
-
-  if (active && pmsPrevActive){
-    if (scoreDelta > 0){
-      bool bonus = (g.roundKind == RK_BONUS_MOVING);
-      pmsPrintEventScore((int32_t)scoreDelta, score, bonus);
-    }
-    if (livesDelta < 0){
-      pmsPrintEventLife(livesDelta, lives);
-    }
   }
 
   // --- Status (silent while idle) ---
