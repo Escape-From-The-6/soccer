@@ -44,7 +44,7 @@
 #endif
 
 #ifndef PMS_DEBUG_SERIAL
-#define PMS_DEBUG_SERIAL 1
+#define PMS_DEBUG_SERIAL 0
 #endif
 
 #ifndef PMS_STATUS_PERIOD_MS
