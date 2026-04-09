@@ -19,10 +19,11 @@
 //
 //   Server -> PMS:
 //     !PMS PONG v=1 game=soccer role=server
-//     !PMS STATUS v=1 state=arming|playing level=.. score=.. lives=.. tleft_ms=.. last_reason=..
-//       (STATUS prints every 250ms while arming/playing; STATUS is NOT emitted while idle)
+//     !PMS STATUS v=1 state=arming|playing|success level=.. score=.. lives=.. tleft_ms=.. last_reason=..
+//       (STATUS prints every 250ms while arming/playing; STATUS is NOT emitted while idle,
+//        except for a one-shot final STATUS with state=success right before a successful game_end)
 //     !PMS EVENT v=1 name=game_start level=..
-//     !PMS EVENT v=1 name=game_end reason=timeup|no_lives|stopped score=.. lives=..
+//     !PMS EVENT v=1 name=game_end reason=success|no_lives|stopped score=.. lives=..
 //     !PMS EVENT v=1 name=score delta=.. total=.. bonus=0|1
 //     !PMS EVENT v=1 name=life delta=-1 lives=..
 //
@@ -55,6 +56,17 @@
 #ifndef SOCCER_BONUS_SCORE_DELTA
 #define SOCCER_BONUS_SCORE_DELTA 2
 #endif
+
+#ifndef SOCCER_SUCCESS_AFTER_MS
+#define SOCCER_SUCCESS_AFTER_MS 360000UL
+#endif
+
+enum SoccerGameEndKind : uint8_t {
+  SGE_NONE     = 0,
+  SGE_STOPPED  = 1,
+  SGE_SUCCESS  = 2,
+  SGE_NO_LIVES = 3
+};
 #if PMS_DEBUG_SERIAL
   #define DBG_PRINT(...)    Serial.print(__VA_ARGS__)
   #define DBG_PRINTLN(...)  Serial.println(__VA_ARGS__)
@@ -278,6 +290,8 @@ struct Game {
   Arena       arenaA        = ARENA_NONE; // for HIT_ALL_A/B mapping
 
   uint32_t    gameStartMs   = 0;
+  uint32_t    gameEndMs     = 0;   // overall 6-minute success timer
+  SoccerGameEndKind lastEndKind = SGE_NONE;
   uint32_t    roundStartMs  = 0;
   uint32_t    roundDurationMs = 0;
 
@@ -740,6 +754,7 @@ static void loseLifeAndRestart(const char* reason){
     DBG_PRINTF("[L%uR%u] out of lives, ending game.\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1));
+    g.lastEndKind = SGE_NO_LIVES;
     g.active = false;
     clearTargets();
     pushLedStates();
@@ -769,6 +784,7 @@ static void loseLifeOnly(const char* reason){
     DBG_PRINTF("[L%uR%u] out of lives, ending game.\n",
       (unsigned)g.levelIndex,
       (unsigned)(g.roundIndex+1));
+    g.lastEndKind = SGE_NO_LIVES;
     g.active = false;
     clearTargets();
     pushLedStates();
@@ -831,11 +847,22 @@ static void finishLevelAdvance(){
       (unsigned long)g.score, (unsigned)g.lives);
     startLevel(4, false);
   } else if (g.levelIndex == 4){
-    DBG_PRINTF("[L4] complete, game finished. final score=%lu lives=%u\n",
-      (unsigned long)g.score, (unsigned)g.lives);
-    g.active = false;
-    clearTargets();
-    pushLedStates();
+    const uint32_t now = millis();
+    const bool successTimerExpired =
+      (g.gameEndMs > 0) && ((int32_t)(now - g.gameEndMs) >= 0);
+
+    if (successTimerExpired){
+      DBG_PRINTF("[L4] complete at success timer, ending SUCCESS. final score=%lu lives=%u\n",
+        (unsigned long)g.score, (unsigned)g.lives);
+      g.lastEndKind = SGE_SUCCESS;
+      g.active = false;
+      clearTargets();
+      pushLedStates();
+    } else {
+      DBG_PRINTF("[L4] complete before 6:00 success timer, restarting Level 4. score=%lu lives=%u\n",
+        (unsigned long)g.score, (unsigned)g.lives);
+      startLevel(4, false);
+    }
   }
 }
 
@@ -1068,6 +1095,8 @@ static void startLevel(uint8_t levelIndex, bool resetScoreAndLives){
   const struct LevelConfig* lc = getLevelConfig(levelIndex);
   if (!lc) return;
 
+  const uint32_t now = millis();
+
   // Extra safety: ensure bonus flag is off at level start
   sendRoundInfo(false);
 
@@ -1076,17 +1105,22 @@ static void startLevel(uint8_t levelIndex, bool resetScoreAndLives){
   g.penaltyMode= lc->penaltyMode;
   g.arena      = ARENA_NONE;
   g.arenaA     = ARENA_NONE;
-  g.gameStartMs= millis();
   memset(lastScoreMsBySensor, 0, sizeof(lastScoreMsBySensor));
 
   if (resetScoreAndLives){
     g.score = 0;
     g.lives = 5;
+    g.gameStartMs = now;
+    g.gameEndMs   = now + SOCCER_SUCCESS_AFTER_MS;
+    g.lastEndKind = SGE_NONE;
 
 #if PMS_STD_ENABLED
     // New game => discard any pending score events from a previous run.
     pmsClearScoreQueue();
 #endif
+  } else if (g.gameStartMs == 0 || g.gameEndMs == 0){
+    g.gameStartMs = now;
+    g.gameEndMs   = now + SOCCER_SUCCESS_AFTER_MS;
   }
 
   sendMode(g.penaltyMode);
@@ -1689,6 +1723,7 @@ static void handlePmsLine(const String& rawLine){
     if (!g.active) return;
 
     pmsStopRequested = true;
+    g.lastEndKind = SGE_STOPPED;
 
     g.active = false;
     clearTargets();
@@ -1860,6 +1895,7 @@ static void handleSerialServer(){
       if (!g.active) DBG_PRINTLN("No active game.");
       else {
         pmsStopRequested = true;
+        g.lastEndKind = SGE_STOPPED;
         g.active = false;
         clearTargets();
         pushLedStates();
@@ -1890,6 +1926,7 @@ static void handleSerialServer(){
 
       if (g.active){
         pmsStopRequested = true;
+        g.lastEndKind = SGE_STOPPED;
         g.active = false;
         DBG_PRINTLN("[TEST] Stopping active game.");
       }
@@ -1914,6 +1951,7 @@ static void handleSerialServer(){
       // Stop any active game so we don't mix targets / rules.
       if (g.active){
         pmsStopRequested = true;
+        g.lastEndKind = SGE_STOPPED;
         g.active = false;
         DBG_PRINTLN("[TEST] Stopping active game.");
       }
@@ -2091,9 +2129,15 @@ static void pmsTick(){
   pmsFlushScoreEvents();
 
   if (ended){
-    const char* reason = "timeup";
-    if (lives == 0) reason = "no_lives";
-    else if (pmsStopRequested) reason = "stopped";
+    const char* reason = "stopped";
+    if (g.lastEndKind == SGE_SUCCESS){
+      pmsPrintStatus("success", level, score, lives, 0, "state");
+      reason = "success";
+    } else if (g.lastEndKind == SGE_NO_LIVES || lives == 0){
+      reason = "no_lives";
+    } else if (g.lastEndKind == SGE_STOPPED || pmsStopRequested){
+      reason = "stopped";
+    }
     pmsPrintEventGameEnd(reason, score, lives);
 
     // Consume stop flag once reported
@@ -2176,6 +2220,16 @@ void loop(){
 
   if (g.active && g.roundKind == RK_BONUS_MOVING){
     updateBonusTargets();
+  }
+
+  if (g.active && g.gameEndMs > 0 && (int32_t)(now - g.gameEndMs) >= 0){
+    DBG_PRINTF("[GAME] SUCCESS: survived overall 6:00 timer. score=%lu lives=%u\n",
+      (unsigned long)g.score,
+      (unsigned)g.lives);
+    g.lastEndKind = SGE_SUCCESS;
+    g.active = false;
+    clearTargets();
+    pushLedStates();
   }
 
   if (g.active && g.roundDurationMs > 0){
