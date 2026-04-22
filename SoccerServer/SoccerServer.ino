@@ -1705,9 +1705,6 @@ static void handlePmsLine(const String& rawLine){
     if (level < 1) level = 1;
     if (level > 4) level = 4;
 
-    // Ignore START if already active (helps PMS retries without restarting the game).
-    if (g.active) return;
-
     // Ensure we are not in TEST mode when starting a real game.
     testMode = false;
 
